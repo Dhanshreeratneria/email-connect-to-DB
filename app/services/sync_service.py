@@ -1,35 +1,211 @@
-from datetime import datetime,timezone
+import logging
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from app.models.email import GmailAccount,Email
-from app.services.gmail_service import get_message,list_messages,history,watch
+
+from app.models.email import Email, GmailAccount
 from app.services.email_parser import parse_message
-def upsert(db:Session,account:GmailAccount,raw:dict):
- data=parse_message(raw);existing=db.scalar(select(Email).where(Email.account_id==account.id,Email.message_id==data["message_id"]))
- if existing:
-  for k,v in data.items():setattr(existing,k,v)
- else: db.add(Email(account_id=account.id,**data))
-def initial_sync(db:Session,account:GmailAccount,service):
- token=None
- while True:
-  page=list_messages(service,token)
-  for item in page.get("messages",[]): upsert(db,account,get_message(service,item["id"]))
-  token=page.get("nextPageToken")
-  if not token: break
- account.history_id=str(service.users().getProfile(userId="me").execute()["historyId"]);db.commit()
-def incremental_sync(db:Session,account:GmailAccount,service,notified_history_id:str|None=None):
- if not account.history_id: return initial_sync(db,account,service)
- try: response=history(service,account.history_id)
- except Exception: return initial_sync(db,account,service)
- seen=set()
- while True:
-  for item in response.get("history",[]):
-   for added in item.get("messagesAdded",[]):
-    mid=added["message"]["id"]
-    if mid not in seen: seen.add(mid);upsert(db,account,get_message(service,mid))
-  token=response.get("nextPageToken")
-  if not token:break
-  response=history(service,account.history_id)
- account.history_id=str(notified_history_id or response.get("historyId") or account.history_id);db.commit()
-def renew_watch(db:Session,account:GmailAccount,service,topic:str):
- response=watch(service,topic);account.history_id=str(response["historyId"]);account.watch_expiration=datetime.fromtimestamp(int(response["expiration"])/1000,timezone.utc);db.commit();return response
+from app.services.gmail_service import (
+    get_message,
+    history,
+    list_messages,
+    profile,
+    watch,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def upsert_email(
+    db: Session,
+    account: GmailAccount,
+    gmail_message: dict,
+) -> Email:
+    """
+    Insert or update a Gmail email.
+
+    Unique protection:
+    account_id + message_id
+    """
+
+    parsed = parse_message(gmail_message)
+
+    existing = db.scalar(
+        select(Email).where(
+            Email.account_id == account.id,
+            Email.message_id == parsed["message_id"],
+        )
+    )
+
+    if existing:
+        for field_name, field_value in parsed.items():
+            setattr(existing, field_name, field_value)
+
+        return existing
+
+    email = Email(
+        account_id=account.id,
+        **parsed,
+    )
+
+    db.add(email)
+
+    return email
+
+
+def initial_sync(
+    db: Session,
+    account: GmailAccount,
+    gmail_service,
+) -> int:
+    """
+    Fetch the mailbox message list and store every accessible email.
+
+    This runs after initial OAuth authorization or as recovery when a
+    stored Gmail History ID becomes invalid.
+    """
+
+    imported_count = 0
+    page_token = None
+
+    while True:
+        response = list_messages(gmail_service, page_token)
+
+        for item in response.get("messages", []):
+            message = get_message(gmail_service, item["id"])
+
+            upsert_email(
+                db=db,
+                account=account,
+                gmail_message=message,
+            )
+
+            imported_count += 1
+
+        page_token = response.get("nextPageToken")
+
+        if not page_token:
+            break
+
+    mailbox_profile = profile(gmail_service)
+
+    account.history_id = str(mailbox_profile["historyId"])
+
+    db.commit()
+
+    logger.info(
+        "Initial Gmail sync completed account=%s imported=%s",
+        account.google_email,
+        imported_count,
+    )
+
+    return imported_count
+
+
+def incremental_sync(
+    db: Session,
+    account: GmailAccount,
+    gmail_service,
+    notification_history_id: str | None = None,
+) -> int:
+    """
+    Uses Gmail History API to retrieve new Gmail messages since the last
+    stored history ID.
+
+    If Gmail rejects an old history ID, caller should run initial_sync.
+    """
+
+    if not account.history_id:
+        return initial_sync(db, account, gmail_service)
+
+    imported_count = 0
+    processed_message_ids: set[str] = set()
+
+    try:
+        response = history(
+            gmail_service,
+            account.history_id,
+        )
+
+        while True:
+            for history_item in response.get("history", []):
+                for added in history_item.get("messagesAdded", []):
+                    message_id = added["message"]["id"]
+
+                    if message_id in processed_message_ids:
+                        continue
+
+                    processed_message_ids.add(message_id)
+
+                    message = get_message(gmail_service, message_id)
+
+                    upsert_email(
+                        db=db,
+                        account=account,
+                        gmail_message=message,
+                    )
+
+                    imported_count += 1
+
+            next_page_token = response.get("nextPageToken")
+
+            if not next_page_token:
+                break
+
+            response = gmail_service.users().history().list(
+                userId="me",
+                startHistoryId=account.history_id,
+                historyTypes=["messageAdded"],
+                pageToken=next_page_token,
+            ).execute()
+
+        account.history_id = str(
+            notification_history_id
+            or response.get("historyId")
+            or account.history_id
+        )
+
+        db.commit()
+
+        return imported_count
+
+    except Exception:
+        logger.exception(
+            "Gmail History API sync failed; starting full resync "
+            "account=%s",
+            account.google_email,
+        )
+
+        return initial_sync(db, account, gmail_service)
+
+
+def create_or_renew_watch(
+    db: Session,
+    account: GmailAccount,
+    gmail_service,
+    pubsub_topic: str,
+) -> dict:
+    """
+    Creates or renews Gmail Watch.
+
+    Requires:
+    - Gmail API enabled
+    - Pub/Sub topic created
+    - gmail-api-push@system.gserviceaccount.com granted Pub/Sub Publisher
+    """
+
+    result = watch(gmail_service, pubsub_topic)
+
+    account.history_id = str(result["historyId"])
+
+    if result.get("expiration"):
+        from datetime import datetime, timezone
+
+        account.watch_expiration = datetime.fromtimestamp(
+            int(result["expiration"]) / 1000,
+            tz=timezone.utc,
+        )
+
+    db.commit()
+
+    return result
