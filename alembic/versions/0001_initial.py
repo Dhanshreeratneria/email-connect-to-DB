@@ -1,0 +1,9 @@
+"""initial gmail email tables"""
+from alembic import op
+import sqlalchemy as sa
+revision="0001_initial"; down_revision=None; branch_labels=None; depends_on=None
+def upgrade():
+ op.create_table("gmail_accounts",sa.Column("id",sa.Integer,primary_key=True),sa.Column("google_email",sa.String(320),nullable=False,unique=True),sa.Column("encrypted_token",sa.Text,nullable=False),sa.Column("history_id",sa.String(64)),sa.Column("watch_expiration",sa.DateTime(timezone=True)),sa.Column("created_at",sa.DateTime(timezone=True),server_default=sa.text("CURRENT_TIMESTAMP")),sa.Column("updated_at",sa.DateTime(timezone=True),server_default=sa.text("CURRENT_TIMESTAMP")))
+ op.create_table("emails",sa.Column("id",sa.Integer,primary_key=True),sa.Column("account_id",sa.Integer,sa.ForeignKey("gmail_accounts.id"),nullable=False),sa.Column("message_id",sa.String(255),nullable=False),sa.Column("thread_id",sa.String(255),nullable=False),sa.Column("sender_name",sa.String(500)),sa.Column("sender_email",sa.String(320),nullable=False),sa.Column("recipients",sa.JSON,nullable=False),sa.Column("subject",sa.Text),sa.Column("body_text",sa.Text),sa.Column("received_at",sa.DateTime(timezone=True),nullable=False),sa.Column("labels",sa.JSON,nullable=False),sa.Column("has_attachments",sa.Boolean,nullable=False,server_default=sa.false()),sa.Column("attachments",sa.JSON,nullable=False),sa.Column("created_at",sa.DateTime(timezone=True),server_default=sa.text("CURRENT_TIMESTAMP")),sa.Column("updated_at",sa.DateTime(timezone=True),server_default=sa.text("CURRENT_TIMESTAMP")),sa.UniqueConstraint("account_id","message_id",name="uq_account_message"))
+ op.create_index("ix_emails_received_at","emails",["received_at"]);op.create_index("ix_emails_thread_id","emails",["thread_id"]);op.create_index("ix_emails_sender_email","emails",["sender_email"])
+def downgrade(): op.drop_table("emails");op.drop_table("gmail_accounts")
