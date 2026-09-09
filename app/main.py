@@ -16,7 +16,7 @@ app.include_router(webhook_router)
 app.include_router(emails_router)
 
 # Remote MCP endpoint
-app.mount("/mcp", mcp.streamable_http_app())
+app.mount("/mcp", mcp.sse_app())
 
 @app.get("/health")
 def health():
