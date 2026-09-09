@@ -6,3 +6,4 @@ credentials.json
 token*.json
 *.db
 .pytest_cache/
+venv/
