@@ -32,50 +32,62 @@ def begin():
 
 
 @router.get("/callback")
-def callback(code: str, state: str = None, db: Session = Depends(get_db)):
+def callback(code: str, db: Session = Depends(get_db)):
     """
     Handles Google OAuth callback.
 
     Flow:
-    Google callback
-        → Validate state
-        → OAuth code exchange with PKCE
-        → Gmail profile lookup
-        → Encrypted token save in PostgreSQL
-        → Initial Gmail import
+    Google callback (with authorization code)
+        → Exchange code for credentials (PKCE handled by Flow)
+        → Get Gmail profile
+        → Save encrypted token to database
+        → Perform initial Gmail sync
     """
 
     try:
-        # Exchange code for credentials (with state validation)
-        credentials = exchange(code, state)
+        logger.info("Starting OAuth callback processing")
+        
+        # Exchange code for credentials
+        # Flow library handles PKCE verification internally
+        credentials = exchange(code)
+        logger.info("Token exchange successful")
+        
+        # Get Gmail service
         service = gmail(credentials)
-
+        
+        # Get Gmail profile
         gmail_profile = profile(service)
         google_email = gmail_profile["emailAddress"]
+        logger.info(f"Got Gmail profile: {google_email}")
 
+        # Check if account already exists
         account = (
             db.query(GmailAccount)
             .filter(GmailAccount.google_email == google_email)
             .first()
         )
 
+        # Encrypt credentials
         encrypted_token = encrypt_credentials(credentials)
 
         if account is None:
+            # Create new account
             account = GmailAccount(
                 google_email=google_email,
                 encrypted_token=encrypted_token,
             )
-
             db.add(account)
-            db.commit()
-            db.refresh(account)
-
+            logger.info(f"Created new Gmail account: {google_email}")
         else:
+            # Update existing account
             account.encrypted_token = encrypted_token
-            db.commit()
-            db.refresh(account)
+            logger.info(f"Updated Gmail account: {google_email}")
 
+        db.commit()
+        db.refresh(account)
+
+        # Perform initial sync
+        logger.info(f"Starting initial Gmail sync for {google_email}")
         initial_sync(db, account, service)
 
         logger.info(
@@ -93,12 +105,10 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
 
     except Exception as exc:
         logger.exception("Google OAuth or Gmail initial sync failed")
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Google OAuth callback or initial Gmail sync failed.",
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-            },
-        ) from exc
+        
+        return {
+            "status": "error",
+            "message": "Google OAuth callback or initial Gmail sync failed.",
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
