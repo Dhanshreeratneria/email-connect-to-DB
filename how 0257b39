@@ -1,0 +1,10 @@
+[33mcommit 0257b39e6087547644151c9ff6ecbc6464cf1440[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: Dhanshree Ratneria <163521607+Dhanshreeratneria@users.noreply.github.com>
+Date:   Wed Sep 9 22:03:49 2026 +0530
+
+    Update Dockerfile
+    
+    mene kiya
+
+ Dockerfile | 5 [32m+++[m[31m--[m
+ 1 file changed, 3 insertions(+), 2 deletions(-)
