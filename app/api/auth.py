@@ -32,20 +32,22 @@ def begin():
 
 
 @router.get("/callback")
-def callback(code: str, db: Session = Depends(get_db)):
+def callback(code: str, state: str = None, db: Session = Depends(get_db)):
     """
     Handles Google OAuth callback.
 
     Flow:
     Google callback
-        → OAuth code exchange
+        → Validate state
+        → OAuth code exchange with PKCE
         → Gmail profile lookup
         → Encrypted token save in PostgreSQL
         → Initial Gmail import
     """
 
     try:
-        credentials = exchange(code)
+        # Exchange code for credentials (with state validation)
+        credentials = exchange(code, state)
         service = gmail(credentials)
 
         gmail_profile = profile(service)
