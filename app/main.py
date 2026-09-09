@@ -1,6 +1,16 @@
-from fastapi import FastAPI, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 from starlette.routing import Mount
+from app.api.auth import router as auth_router
+from app.api.webhook import router as webhook_router
+from app.api.emails import router as emails_router
 from app.mcp.server import mcp
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
 
 app = FastAPI(title="Gmail Email MCP", lifespan=lifespan)
 
@@ -8,20 +18,13 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 
-# Wrap SSE app so it works at /mcp without redirect
-sse_app = mcp.sse_app()
+# Mount MCP with redirect_slashes=False to avoid /mcp → /mcp/
+app.mount("/mcp", mcp.sse_app(), name="mcp")
 
-async def mcp_proxy(scope, receive, send):
-    # Normalize path: treat /mcp and /mcp/ the same
-    if scope["type"] == "http":
-        path = scope["path"]
-        if path == "/mcp":
-            scope["path"] = "/mcp/"
-        elif path.startswith("/mcp/"):
-            pass  # already under /mcp/
-        else:
-            # Should not happen if mounted correctly
-            pass
-    await sse_app(scope, receive, send)
+# Optionally disable global redirect_slashes for the whole app
+app.router.redirect_slashes = False
 
-app.mount("/mcp", mcp_proxy)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
