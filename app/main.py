@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
@@ -17,6 +17,9 @@ app = FastAPI(title="Gmail Email MCP", lifespan=lifespan)
 app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
+
+# Add MCP SSE endpoint using add_route (works with ASGI apps)
+app.add_route("/mcp", mcp.sse_app(), methods=["GET"])
 
 
 # Claude.ai OAuth authorization endpoint
@@ -79,8 +82,21 @@ async def connector_status():
     }
 
 
-# Mount MCP SSE app directly
-app.mount("/mcp", mcp.sse_app(), name="mcp_sse")
+# MCP SSE endpoint - proper streaming response
+@app.get("/mcp")
+async def mcp_sse():
+    """
+    MCP Server-Sent Events endpoint for Claude.ai.
+    """
+    return StreamingResponse(
+        mcp.sse_app(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 # MCP info endpoint for debugging and verification
