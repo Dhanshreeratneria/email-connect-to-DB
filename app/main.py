@@ -2,6 +2,7 @@
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from mcp.server.transport_security import TransportSecuritySettings
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
@@ -29,13 +30,20 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 
-# MCP endpoint - mount at /mcp for Claude.ai
-# Use add_route to avoid FastAPI's automatic trailing slash redirect
-app.add_route(
-    "/mcp",
-    mcp.streamable_http_app(),
-    methods=["GET", "POST", "OPTIONS", "HEAD"]
+mcp.settings.streamable_http_path = "/"
+
+# FastMCP's DNS-rebinding protection rejects any Host header not on this
+# allow-list. Render's domain isn't localhost, so it must be listed
+# explicitly or every request gets "421 Invalid Host header".
+mcp.settings.transport_security = TransportSecuritySettings(
+    allowed_hosts=["email-connect-to-db.onrender.com"],
+    allowed_origins=["*"],
 )
+
+# MCP endpoint - mount at /mcp for Claude.ai.
+# app.mount is required here (not add_route): streamable_http_app() returns
+# a full ASGI sub-application, and only mount() attaches a sub-app correctly.
+app.mount("/mcp", mcp.streamable_http_app(), name="mcp")
 
 
 # Claude.ai OAuth authorization endpoint
@@ -51,10 +59,10 @@ async def authorize(
 ):
     """
     OAuth authorization endpoint for Claude.ai connector.
-    
+
     Claude.ai calls this to authenticate the connector.
     """
-    
+
     # Validate request
     if response_type != "code":
         return JSONResponse(
@@ -62,25 +70,26 @@ async def authorize(
             content={"error": "unsupported_response_type"},
             headers={"Access-Control-Allow-Origin": "*"}
         )
-    
+
     # For PKCE flow, generate auth code
     import secrets
     import base64
-    
+
     # Generate authorization code
     auth_code = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
-    
+
     # Build redirect with auth code
     redirect_params = f"code={auth_code}&state={state}"
-    
+
     if "?" in redirect_uri:
         redirect_url = f"{redirect_uri}&{redirect_params}"
     else:
         redirect_url = f"{redirect_uri}?{redirect_params}"
-    
+
     # Redirect back to Claude.ai with authorization code
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=redirect_url)
+
 
 # Connector status endpoint
 @app.get("/connector/status")
