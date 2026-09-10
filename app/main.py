@@ -19,7 +19,7 @@ app.include_router(webhook_router)
 app.include_router(emails_router)
 
 # Add MCP SSE endpoint using add_route (works with ASGI apps)
-app.add_route("/mcp", mcp.sse_app(), methods=["GET"])
+app.add_route("/mcp", mcp.streamable_http_app(), methods=["GET"])
 
 
 # Claude.ai OAuth authorization endpoint
@@ -89,7 +89,7 @@ async def mcp_sse():
     MCP Server-Sent Events endpoint for Claude.ai.
     """
     return StreamingResponse(
-        mcp.sse_app(),
+        mcp.streamable_http_app(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
