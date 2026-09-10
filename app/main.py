@@ -8,7 +8,11 @@ from app.mcp.server import mcp
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
+    # The MCP Streamable HTTP session manager needs its internal task group
+    # started before any /mcp request comes in -- that only happens by
+    # running mcp.session_manager.run() as part of this app's own startup.
+    async with mcp.session_manager.run():
+        yield
 
 
 app = FastAPI(title="Gmail Email MCP", lifespan=lifespan)
@@ -17,9 +21,6 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 
-# Set the path on the settings object instead of passing it as an argument --
-# streamable_http_app() doesn't accept a keyword argument in this mcp
-# package version, but reads mcp.settings.streamable_http_path internally.
 mcp.settings.streamable_http_path = "/"
 app.mount("/mcp", mcp.streamable_http_app(), name="mcp")
 
