@@ -32,7 +32,7 @@ def query(stmt):
         db.close()
 
 @mcp.tool()
-def search_emails(query_text: str, limit: int = 20) -> list[dict]:
+def search_emails(query_text: str, limit: int = 100) -> list[dict]:
     """Search sender, subject, and text body."""
     q = f"%{query_text}%"
     return query(
@@ -55,7 +55,7 @@ def get_email(message_id: str) -> dict | None:
     return rows[0] if rows else None
 
 @mcp.tool()
-def list_emails(limit: int = 20) -> list[dict]:
+def list_emails(limit: int = 100) -> list[dict]:
     return query(
         select(Email).order_by(Email.received_at.desc()).limit(min(limit, 100))
     )
@@ -67,7 +67,7 @@ def get_thread(thread_id: str) -> list[dict]:
     )
 
 @mcp.tool()
-def search_by_sender(sender: str, limit: int = 20) -> list[dict]:
+def search_by_sender(sender: str, limit: int = 100) -> list[dict]:
     return query(
         select(Email)
         .where(Email.sender_email.ilike(f"%{sender}%"))
@@ -76,7 +76,7 @@ def search_by_sender(sender: str, limit: int = 20) -> list[dict]:
     )
 
 @mcp.tool()
-def search_by_subject(subject: str, limit: int = 20) -> list[dict]:
+def search_by_subject(subject: str, limit: int = 100) -> list[dict]:
     return query(
         select(Email)
         .where(Email.subject.ilike(f"%{subject}%"))
