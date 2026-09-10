@@ -1,11 +1,13 @@
-import logging
+﻿import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models.email import GmailAccount
+from app.services import connector_auth
 from app.services.gmail_service import gmail, profile
 from app.services.oauth_service import (
     authorization_url,
@@ -21,12 +23,7 @@ router = APIRouter(prefix="/auth/google")
 
 @router.get("")
 def begin():
-    """
-    Starts Google OAuth authorization.
-
-    Open:
-    http://localhost:8000/auth/google
-    """
+    """Starts Google OAuth for manually onboarding a mailbox."""
     url, _state = authorization_url()
     return RedirectResponse(url)
 
@@ -34,67 +31,57 @@ def begin():
 @router.get("/callback")
 def callback(code: str, state: str = None, db: Session = Depends(get_db)):
     """
-    Handles Google OAuth callback.
-
-    Flow:
-    Google callback (with authorization code and state)
-        → Exchange code for credentials (with state validation)
-        → Get Gmail profile
-        → Save encrypted token to database
-        → Perform initial Gmail sync
+    Handles Google OAuth callback for two flows sharing one login screen:
+      1. Manual visit to /auth/google -> syncs mailbox, returns JSON.
+      2. Claude.ai connector flow (started from /authorize) -> after
+         confirming the Google account is the allowed owner, redirects
+         back to Claude.ai with an authorization code instead of JSON.
     """
+    pending = connector_auth.resolve_google_state(state) if state else None
 
     try:
         logger.info("Starting OAuth callback processing")
-        logger.info(f"Callback state: {state[:20] if state else 'None'}...")
-        
-        # Exchange code for credentials
-        # Pass state for proper PKCE validation
+
         credentials = exchange(code, state)
         logger.info("Token exchange successful")
-        
-        # Get Gmail service
+
         service = gmail(credentials)
-        
-        # Get Gmail profile
         gmail_profile = profile(service)
         google_email = gmail_profile["emailAddress"]
         logger.info(f"Got Gmail profile: {google_email}")
 
-        # Check if account already exists
+        if pending is not None and google_email != settings.connector_allowed_email:
+            logger.warning("Connector login rejected for %s", google_email)
+            denial_url = f"{pending['redirect_uri']}?error=access_denied&state={pending['state']}"
+            return RedirectResponse(denial_url)
+
         account = (
             db.query(GmailAccount)
             .filter(GmailAccount.google_email == google_email)
             .first()
         )
 
-        # Encrypt credentials
         encrypted_token = encrypt_credentials(credentials)
 
         if account is None:
-            # Create new account
-            account = GmailAccount(
-                google_email=google_email,
-                encrypted_token=encrypted_token,
-            )
+            account = GmailAccount(google_email=google_email, encrypted_token=encrypted_token)
             db.add(account)
             logger.info(f"Created new Gmail account: {google_email}")
         else:
-            # Update existing account
             account.encrypted_token = encrypted_token
             logger.info(f"Updated Gmail account: {google_email}")
 
         db.commit()
         db.refresh(account)
 
-        # Perform initial sync
         logger.info(f"Starting initial Gmail sync for {google_email}")
         initial_sync(db, account, service)
+        logger.info("Initial Gmail sync completed for account=%s", google_email)
 
-        logger.info(
-            "Initial Gmail sync completed for account=%s",
-            google_email,
-        )
+        if pending is not None:
+            auth_code = connector_auth.issue_auth_code(pending, google_email)
+            redirect_url = f"{pending['redirect_uri']}?code={auth_code}&state={pending['state']}"
+            return RedirectResponse(redirect_url)
 
         return {
             "status": "connected",
@@ -106,7 +93,9 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
 
     except Exception as exc:
         logger.exception("Google OAuth or Gmail initial sync failed")
-        
+        if pending is not None:
+            error_url = f"{pending['redirect_uri']}?error=server_error&state={pending['state']}"
+            return RedirectResponse(error_url)
         return {
             "status": "error",
             "message": "Google OAuth callback or initial Gmail sync failed.",

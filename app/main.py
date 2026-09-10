@@ -1,12 +1,17 @@
 ﻿from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse, JSONResponse
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.transport_security import TransportSecuritySettings
+
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
+from app.config import settings
 from app.mcp.server import mcp
+from app.services import connector_auth
+from app.services.oauth_service import authorization_url
 
 
 @asynccontextmanager
@@ -17,7 +22,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Gmail Email MCP", lifespan=lifespan)
 
-# Add CORS middleware for Claude.ai
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,22 +35,85 @@ app.include_router(webhook_router)
 app.include_router(emails_router)
 
 mcp.settings.streamable_http_path = "/"
-
-# FastMCP's DNS-rebinding protection rejects any Host header not on this
-# allow-list. Render's domain isn't localhost, so it must be listed
-# explicitly or every request gets "421 Invalid Host header".
 mcp.settings.transport_security = TransportSecuritySettings(
     allowed_hosts=["email-connect-to-db.onrender.com"],
     allowed_origins=["*"],
 )
 
-# MCP endpoint - mount at /mcp for Claude.ai.
-# app.mount is required here (not add_route): streamable_http_app() returns
-# a full ASGI sub-application, and only mount() attaches a sub-app correctly.
-app.mount("/mcp", mcp.streamable_http_app(), name="mcp")
+
+class RequireBearerToken:
+    """Wraps the MCP ASGI app; rejects requests without a valid token
+    issued by our /token endpoint."""
+
+    def __init__(self, inner_app):
+        self.inner_app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.inner_app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        auth_header = headers.get(b"authorization", b"").decode()
+        token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
+        token_data = connector_auth.verify_access_token(token) if token else None
+
+        if not token_data:
+            base = settings.public_base_url.rstrip("/")
+            response = JSONResponse(
+                {"error": "unauthorized", "error_description": "Missing or invalid access token"},
+                status_code=401,
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer realm="mcp", '
+                        f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                    )
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.inner_app(scope, receive, send)
 
 
-# Claude.ai OAuth authorization endpoint
+app.mount("/mcp", RequireBearerToken(mcp.streamable_http_app()), name="mcp")
+
+
+@app.get("/.well-known/oauth-protected-resource")
+async def protected_resource_metadata():
+    base = settings.public_base_url.rstrip("/")
+    return {"resource": f"{base}/mcp", "authorization_servers": [base]}
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def authorization_server_metadata():
+    base = settings.public_base_url.rstrip("/")
+    return {
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    }
+
+
+@app.post("/register")
+async def register_client(request: Request):
+    body = await request.json()
+    redirect_uris = body.get("redirect_uris", [])
+    client_id = connector_auth.register_client(redirect_uris)
+    return JSONResponse({
+        "client_id": client_id,
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    })
+
+
 @app.get("/authorize")
 @app.options("/authorize")
 async def authorize(
@@ -56,102 +123,92 @@ async def authorize(
     code_challenge: str = None,
     code_challenge_method: str = None,
     state: str = None,
+    resource: str = None,
 ):
-    """
-    OAuth authorization endpoint for Claude.ai connector.
+    """Bounces the browser through real Google login. Only the mailbox
+    owner's account (checked in /auth/google/callback) gets a code."""
+    if response_type != "code" or not redirect_uri or not code_challenge:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    Claude.ai calls this to authenticate the connector.
-    """
+    conn_state = connector_auth.start_authorization(
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
+        state=state,
+        resource=resource,
+    )
 
-    # Validate request
-    if response_type != "code":
-        return JSONResponse(
-            status_code=400,
-            content={"error": "unsupported_response_type"},
-            headers={"Access-Control-Allow-Origin": "*"}
-        )
+    google_auth_url, google_state = authorization_url()
+    connector_auth.map_google_state(google_state, conn_state)
 
-    # For PKCE flow, generate auth code
-    import secrets
-    import base64
-
-    # Generate authorization code
-    auth_code = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
-
-    # Build redirect with auth code
-    redirect_params = f"code={auth_code}&state={state}"
-
-    if "?" in redirect_uri:
-        redirect_url = f"{redirect_uri}&{redirect_params}"
-    else:
-        redirect_url = f"{redirect_uri}?{redirect_params}"
-
-    # Redirect back to Claude.ai with authorization code
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=redirect_url)
+    return RedirectResponse(google_auth_url)
 
 
-# Connector status endpoint
+@app.post("/token")
+async def token_endpoint(request: Request):
+    form = await request.form()
+    if form.get("grant_type") != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    data = connector_auth.redeem_auth_code(
+        form.get("code"), form.get("code_verifier"), form.get("redirect_uri")
+    )
+    if not data:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+    return JSONResponse(connector_auth.issue_access_token(data["google_email"]))
+
+
 @app.get("/connector/status")
 async def connector_status():
-    """Check connector status"""
     return {
         "status": "connected",
         "name": "Gmail Email MCP",
         "version": "1.0",
-        "authenticated": True,
-        "endpoints": {
-            "mcp": "/mcp",
-            "emails": "/emails",
-            "health": "/health"
-        }
+        "endpoints": {"mcp": "/mcp", "emails": "/emails", "health": "/health"},
     }
 
 
-# MCP info endpoint for debugging and verification
 @app.get("/mcp/info")
 async def mcp_info():
-    """MCP Server information"""
+    base = settings.public_base_url.rstrip("/")
     return {
         "name": "Gmail Email MCP",
         "version": "1.0",
         "status": "ready",
-        "url": "https://email-connect-to-db.onrender.com/mcp",
+        "url": f"{base}/mcp",
         "capabilities": {
             "tools": [
-                "search_emails",
-                "get_email",
-                "list_emails",
-                "get_thread",
-                "search_by_sender",
-                "search_by_subject",
-                "search_by_date"
+                "search_emails", "get_email", "list_emails", "get_thread",
+                "search_by_sender", "search_by_subject", "search_by_date",
             ]
-        }
+        },
     }
 
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""
     return {"status": "ok"}
 
 
 @app.get("/")
 def root():
-    """Root endpoint with service info"""
+    base = settings.public_base_url.rstrip("/")
     return {
         "service": "Gmail Email MCP",
         "version": "1.0",
         "status": "running",
-        "mcp_endpoint": "https://email-connect-to-db.onrender.com/mcp",
+        "mcp_endpoint": f"{base}/mcp",
         "endpoints": {
             "health": "/health",
             "authorize": "/authorize",
+            "token": "/token",
+            "register": "/register",
             "connector_status": "/connector/status",
             "mcp": "/mcp",
             "mcp_info": "/mcp/info",
             "emails": "/emails",
-            "auth": "/auth/google"
-        }
+            "auth": "/auth/google",
+        },
     }
