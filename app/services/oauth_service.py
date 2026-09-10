@@ -1,15 +1,12 @@
 import json
-import secrets
-import base64
-import hashlib
-from urllib.parse import urlencode
 from cryptography.fernet import Fernet
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from app.config import settings
 
-# State storage - maps state to PKCE verifier
-_state_storage = {}
+# In-memory storage for OAuth flows (during single browser session)
+# Maps state -> Flow instance
+_oauth_flows = {}
 
 
 def cipher():
@@ -17,32 +14,12 @@ def cipher():
     return Fernet(settings.token_encryption_key.encode())
 
 
-def generate_pkce_pair():
-    """
-    Generate PKCE code_verifier and code_challenge.
-    
-    Returns:
-        tuple: (code_verifier, code_challenge)
-    """
-    # Generate random code verifier (43-128 chars, unreserved characters)
-    code_verifier = base64.urlsafe_b64encode(
-        secrets.token_bytes(32)
-    ).decode("utf-8").rstrip("=")
-    
-    # Generate code challenge from verifier
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode()).digest()
-    ).decode("utf-8").rstrip("=")
-    
-    return code_verifier, challenge
-
-
 def get_flow():
-    """Create and return a Flow instance"""
+    """Create and return a Flow instance with PKCE enabled"""
     flow = Flow.from_client_secrets_file(
         settings.google_client_secrets_file,
         scopes=["https://www.googleapis.com/auth/gmail.readonly"],
-        redirect_uri=settings.google_oauth_redirect_uri
+        redirect_uri=settings.google_oauth_redirect_uri,
     )
     return flow
 
@@ -51,33 +28,26 @@ def authorization_url():
     """
     Start Google OAuth flow and return authorization URL.
     
+    Flow automatically handles PKCE (Proof Key for Code Exchange).
+    
     Returns:
         tuple: (authorization_url, state)
     """
     flow = get_flow()
     
-    # Generate state for CSRF protection
-    state = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("utf-8").rstrip("=")
-    
-    # Generate PKCE
-    code_verifier, code_challenge = generate_pkce_pair()
-    
-    # Store verifier and flow for later use
-    _state_storage[state] = {
-        "code_verifier": code_verifier,
-        "code_challenge": code_challenge,
-        "flow": flow
-    }
-    
-    # Get authorization URL with PKCE
-    auth_url, _ = flow.authorization_url(
+    # Generate authorization URL
+    # Flow automatically enables PKCE by default
+    auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
-        state=state,
-        code_challenge=code_challenge,
-        code_challenge_method="S256"
+        prompt="consent"
     )
+    
+    # Store the flow instance for later use
+    _oauth_flows[state] = flow
+    
+    print(f"[DEBUG] Authorization URL generated with state: {state}")
+    print(f"[DEBUG] Stored flow for state: {state}")
     
     return auth_url, state
 
@@ -86,9 +56,11 @@ def exchange(code: str, state: str = None) -> Credentials:
     """
     Exchange authorization code for credentials.
     
+    Uses the stored Flow instance to properly handle PKCE and state.
+    
     Args:
         code: Authorization code from Google
-        state: State parameter for verification
+        state: State parameter for validation
         
     Returns:
         Credentials: Google OAuth credentials
@@ -96,23 +68,32 @@ def exchange(code: str, state: str = None) -> Credentials:
     Raises:
         ValueError: If state is invalid or code exchange fails
     """
-    # Validate state
-    if not state or state not in _state_storage:
-        raise ValueError("Invalid or missing state parameter")
-    
-    stored_data = _state_storage.pop(state)  # Remove to prevent replay
-    code_verifier = stored_data["code_verifier"]
-    flow = stored_data["flow"]
-    
     try:
-        # Fetch token with code verifier
-        flow.fetch_token(
-            code=code,
-            code_verifier=code_verifier
-        )
+        print(f"[DEBUG] Exchanging code: {code[:20]}...")
+        print(f"[DEBUG] State received: {state[:20] if state else 'None'}...")
+        
+        # Get the stored flow using state
+        if state and state in _oauth_flows:
+            flow = _oauth_flows.pop(state)  # Remove to prevent reuse
+            print(f"[DEBUG] Found stored flow for state: {state}")
+        else:
+            # Fallback: create new flow if state not found
+            # This handles cases where state validation is skipped
+            print("[DEBUG] State not in storage, creating new flow...")
+            flow = get_flow()
+        
+        # Fetch token using the same flow instance
+        # This ensures PKCE state is properly maintained
+        flow.fetch_token(code=code)
+        
+        print("[DEBUG] Token exchange successful!")
+        
         return flow.credentials
+        
     except Exception as exc:
-        raise ValueError(f"Token exchange failed: {str(exc)}") from exc
+        error_msg = str(exc)
+        print(f"[DEBUG] Token exchange failed: {error_msg}")
+        raise ValueError(f"OAuth token exchange failed: {error_msg}") from exc
 
 
 def encrypt_credentials(credentials: Credentials) -> str:

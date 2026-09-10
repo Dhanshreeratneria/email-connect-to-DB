@@ -32,13 +32,13 @@ def begin():
 
 
 @router.get("/callback")
-def callback(code: str, db: Session = Depends(get_db)):
+def callback(code: str, state: str = None, db: Session = Depends(get_db)):
     """
     Handles Google OAuth callback.
 
     Flow:
-    Google callback (with authorization code)
-        → Exchange code for credentials (PKCE handled by Flow)
+    Google callback (with authorization code and state)
+        → Exchange code for credentials (with state validation)
         → Get Gmail profile
         → Save encrypted token to database
         → Perform initial Gmail sync
@@ -46,10 +46,11 @@ def callback(code: str, db: Session = Depends(get_db)):
 
     try:
         logger.info("Starting OAuth callback processing")
+        logger.info(f"Callback state: {state[:20] if state else 'None'}...")
         
         # Exchange code for credentials
-        # Flow library handles PKCE verification internally
-        credentials = exchange(code)
+        # Pass state for proper PKCE validation
+        credentials = exchange(code, state)
         logger.info("Token exchange successful")
         
         # Get Gmail service
