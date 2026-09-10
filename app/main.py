@@ -17,7 +17,11 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 
-app.mount("/mcp", mcp.streamable_http_app(streamable_http_path="/"), name="mcp")
+# Set the path on the settings object instead of passing it as an argument --
+# streamable_http_app() doesn't accept a keyword argument in this mcp
+# package version, but reads mcp.settings.streamable_http_path internally.
+mcp.settings.streamable_http_path = "/"
+app.mount("/mcp", mcp.streamable_http_app(), name="mcp")
 
 
 @app.get("/health")
