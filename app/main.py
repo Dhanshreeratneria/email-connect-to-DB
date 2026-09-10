@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
@@ -14,16 +15,43 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Gmail Email MCP", lifespan=lifespan)
 
+# Add CORS middleware for Claude.ai
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 
-# Add MCP SSE endpoint using add_route (works with ASGI apps)
-app.add_route("/mcp", mcp.sse_app(), methods=["GET"])
+# MCP SSE endpoint - handle both GET and POST
+@app.get("/mcp")
+@app.post("/mcp")
+@app.options("/mcp")
+async def mcp_sse():
+    """
+    MCP Server-Sent Events endpoint for Claude.ai.
+    Handles GET for SSE streaming, OPTIONS for CORS.
+    """
+    return StreamingResponse(
+        mcp.sse_app(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
 
 
 # Claude.ai OAuth authorization endpoint
 @app.get("/authorize")
+@app.options("/authorize")
 async def authorize(
     response_type: str = None,
     client_id: str = None,
@@ -42,7 +70,8 @@ async def authorize(
     if response_type != "code":
         return JSONResponse(
             status_code=400,
-            content={"error": "unsupported_response_type"}
+            content={"error": "unsupported_response_type"},
+            headers={"Access-Control-Allow-Origin": "*"}
         )
     
     # For PKCE flow, generate auth code
@@ -64,7 +93,6 @@ async def authorize(
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=redirect_url)
 
-
 # Connector status endpoint
 @app.get("/connector/status")
 async def connector_status():
@@ -80,23 +108,6 @@ async def connector_status():
             "health": "/health"
         }
     }
-
-
-# MCP SSE endpoint - proper streaming response
-@app.get("/mcp")
-async def mcp_sse():
-    """
-    MCP Server-Sent Events endpoint for Claude.ai.
-    """
-    return StreamingResponse(
-        mcp.sse_app(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
 
 
 # MCP info endpoint for debugging and verification
