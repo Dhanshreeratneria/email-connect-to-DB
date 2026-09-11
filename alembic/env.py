@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings
 from app.database import Base
-from app.models.email import Email, GmailAccount
+from app.models.email import Email, EmailDelivery, GmailAccount
 config=context.config
 config.set_main_option("sqlalchemy.url",settings.database_url)
 if config.config_file_name: fileConfig(config.config_file_name)
