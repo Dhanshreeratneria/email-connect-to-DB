@@ -1,7 +1,30 @@
 import base64
 from datetime import datetime, timezone
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import getaddresses, parseaddr, parsedate_to_datetime
 from typing import Any
+
+
+# Maps Gmail's category label IDs to a clean, storable value.
+# Anything without one of these labels is treated as "primary"
+# (Gmail's default inbox tab).
+CATEGORY_LABEL_MAP = {
+    "CATEGORY_PERSONAL": "primary",
+    "CATEGORY_SOCIAL": "social",
+    "CATEGORY_PROMOTIONS": "promotions",
+    "CATEGORY_UPDATES": "updates",
+    "CATEGORY_FORUMS": "forums",
+}
+
+
+def categorize(label_ids: list[str]) -> str:
+    """
+    Returns one of: primary, social, promotions, updates, forums.
+    """
+    for label in label_ids:
+        if label in CATEGORY_LABEL_MAP:
+            return CATEGORY_LABEL_MAP[label]
+
+    return "primary"
 
 
 def decode_base64_urlsafe(value: str) -> str:
@@ -47,19 +70,42 @@ def parse_received_at(message: dict[str, Any], headers: dict[str, str]) -> datet
     return datetime.now(timezone.utc)
 
 
+def extract_addresses(header_value: str) -> list[str]:
+    """
+    Parses a raw To/Cc header value (which may contain multiple,
+    comma-separated "Name <email>" entries) into a clean lowercase
+    list of just the email addresses.
+    """
+    if not header_value:
+        return []
+
+    return [
+        addr.strip().lower()
+        for _, addr in getaddresses([header_value])
+        if addr and addr.strip()
+    ]
+
+
 def parse_message(message: dict[str, Any]) -> dict[str, Any]:
     """
     Converts Gmail API messages.get(format='full') payload into
     PostgreSQL-ready email fields.
 
     This stores:
-    - Gmail message/thread IDs
+    - Gmail thread ID
+    - RFC Message-ID header (stable across every recipient's copy
+      of the same email, used to dedupe across connected accounts)
     - Sender
-    - To/CC/BCC recipients
+    - To/CC/BCC recipients (display list)
     - Subject
     - Plain-text MIME body
-    - Labels
+    - Labels + derived category (primary/social/promotions/updates/forums)
     - Attachment metadata
+
+    Also returns two extra, non-column keys — "to_addresses" and
+    "cc_addresses" — which the sync service uses to work out whether
+    a given connected account received this email as To, Cc, or Bcc.
+    These two keys must be popped before constructing an Email(**parsed).
     """
 
     payload = message.get("payload") or {}
@@ -127,8 +173,10 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
     if not body_text and html_parts:
         body_text = "\n".join(html_parts).strip()
 
+    label_ids = message.get("labelIds") or []
+
     return {
-        "message_id": message["id"],
+        "rfc_message_id": headers.get("message-id") or None,
         "thread_id": message.get("threadId", ""),
         "sender_name": sender_name or None,
         "sender_email": sender_email or headers.get("from", ""),
@@ -136,7 +184,11 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
         "subject": headers.get("subject", ""),
         "body_text": body_text,
         "received_at": parse_received_at(message, headers),
-        "labels": message.get("labelIds") or [],
+        "labels": label_ids,
+        "category": categorize(label_ids),
         "has_attachments": len(attachments) > 0,
         "attachments": attachments,
+        # Extra, non-column fields for delivery-type detection:
+        "to_addresses": extract_addresses(headers.get("to", "")),
+        "cc_addresses": extract_addresses(headers.get("cc", "")),
     }

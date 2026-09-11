@@ -2,7 +2,7 @@ from datetime import datetime
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
 from app.database import SessionLocal
-from app.models.email import Email
+from app.models.email import Email, EmailDelivery
 
 mcp = FastMCP(
     "Gmail Email Search",
@@ -11,7 +11,8 @@ mcp = FastMCP(
 
 def serialize(e: Email):
     return {
-        "message_id": e.message_id,
+        "id": e.id,
+        "rfc_message_id": e.rfc_message_id,
         "thread_id": e.thread_id,
         "sender_name": e.sender_name,
         "sender_email": e.sender_email,
@@ -20,6 +21,7 @@ def serialize(e: Email):
         "body_text": e.body_text,
         "received_at": e.received_at.isoformat(),
         "labels": e.labels,
+        "category": e.category,
         "has_attachments": e.has_attachments,
         "attachments": e.attachments,
     }
@@ -32,7 +34,7 @@ def query(stmt):
         db.close()
 
 @mcp.tool()
-def search_emails(query_text: str, limit: int = 100) -> list[dict]:
+def search_emails(query_text: str, limit: int = 20) -> list[dict]:
     """Search sender, subject, and text body."""
     q = f"%{query_text}%"
     return query(
@@ -49,15 +51,35 @@ def search_emails(query_text: str, limit: int = 100) -> list[dict]:
     )
 
 @mcp.tool()
-def get_email(message_id: str) -> dict | None:
-    """Get one stored email by Gmail message ID."""
-    rows = query(select(Email).where(Email.message_id == message_id))
-    return rows[0] if rows else None
+def get_email(gmail_message_id: str) -> dict | None:
+    """Get one stored email by its Gmail message ID (per-inbox id)."""
+    db = SessionLocal()
+    try:
+        delivery = db.scalar(
+            select(EmailDelivery).where(
+                EmailDelivery.gmail_message_id == gmail_message_id
+            )
+        )
+        return serialize(delivery.email) if delivery else None
+    finally:
+        db.close()
 
 @mcp.tool()
-def list_emails(limit: int = 100) -> list[dict]:
+def list_emails(limit: int = 20) -> list[dict]:
     return query(
         select(Email).order_by(Email.received_at.desc()).limit(min(limit, 100))
+    )
+
+@mcp.tool()
+def list_emails_by_category(
+    category: str, limit: int = 20
+) -> list[dict]:
+    """category: primary | social | promotions | updates | forums"""
+    return query(
+        select(Email)
+        .where(Email.category == category.lower())
+        .order_by(Email.received_at.desc())
+        .limit(min(limit, 100))
     )
 
 @mcp.tool()
@@ -67,7 +89,7 @@ def get_thread(thread_id: str) -> list[dict]:
     )
 
 @mcp.tool()
-def search_by_sender(sender: str, limit: int = 100) -> list[dict]:
+def search_by_sender(sender: str, limit: int = 20) -> list[dict]:
     return query(
         select(Email)
         .where(Email.sender_email.ilike(f"%{sender}%"))
@@ -76,7 +98,7 @@ def search_by_sender(sender: str, limit: int = 100) -> list[dict]:
     )
 
 @mcp.tool()
-def search_by_subject(subject: str, limit: int = 100) -> list[dict]:
+def search_by_subject(subject: str, limit: int = 20) -> list[dict]:
     return query(
         select(Email)
         .where(Email.subject.ilike(f"%{subject}%"))
