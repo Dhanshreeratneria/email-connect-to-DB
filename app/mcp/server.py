@@ -34,10 +34,10 @@ def query(stmt):
         db.close()
 
 @mcp.tool()
-def search_emails(query_text: str, limit: int = 20) -> list[dict]:
-    """Search sender, subject, and text body."""
+def search_emails(query_text: str, limit: int | None = None) -> list[dict]:
+    """Search sender, subject, and text body. Omit limit for all matches."""
     q = f"%{query_text}%"
-    return query(
+    stmt = (
         select(Email)
         .where(
             or_(
@@ -47,8 +47,10 @@ def search_emails(query_text: str, limit: int = 20) -> list[dict]:
             )
         )
         .order_by(Email.received_at.desc())
-        .limit(min(limit, 100))
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
 
 @mcp.tool()
 def get_email(gmail_message_id: str) -> dict | None:
@@ -65,22 +67,26 @@ def get_email(gmail_message_id: str) -> dict | None:
         db.close()
 
 @mcp.tool()
-def list_emails(limit: int = 20) -> list[dict]:
-    return query(
-        select(Email).order_by(Email.received_at.desc()).limit(min(limit, 100))
-    )
+def list_emails(limit: int | None = None) -> list[dict]:
+    """List all emails, most recent first. Omit limit for everything."""
+    stmt = select(Email).order_by(Email.received_at.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
 
 @mcp.tool()
 def list_emails_by_category(
-    category: str, limit: int = 20
+    category: str, limit: int | None = None
 ) -> list[dict]:
     """category: primary | social | promotions | updates | forums"""
-    return query(
+    stmt = (
         select(Email)
         .where(Email.category == category.lower())
         .order_by(Email.received_at.desc())
-        .limit(min(limit, 100))
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
 
 @mcp.tool()
 def get_thread(thread_id: str) -> list[dict]:
@@ -89,31 +95,37 @@ def get_thread(thread_id: str) -> list[dict]:
     )
 
 @mcp.tool()
-def search_by_sender(sender: str, limit: int = 20) -> list[dict]:
-    return query(
+def search_by_sender(sender: str, limit: int | None = None) -> list[dict]:
+    stmt = (
         select(Email)
         .where(Email.sender_email.ilike(f"%{sender}%"))
         .order_by(Email.received_at.desc())
-        .limit(min(limit, 100))
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
 
 @mcp.tool()
-def search_by_subject(subject: str, limit: int = 20) -> list[dict]:
-    return query(
+def search_by_subject(subject: str, limit: int | None = None) -> list[dict]:
+    stmt = (
         select(Email)
         .where(Email.subject.ilike(f"%{subject}%"))
         .order_by(Email.received_at.desc())
-        .limit(min(limit, 100))
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
 
 @mcp.tool()
-def search_by_date(start_iso: str, end_iso: str, limit: int = 50) -> list[dict]:
-    return query(
+def search_by_date(start_iso: str, end_iso: str, limit: int | None = None) -> list[dict]:
+    stmt = (
         select(Email)
         .where(
             Email.received_at >= datetime.fromisoformat(start_iso),
             Email.received_at <= datetime.fromisoformat(end_iso),
         )
         .order_by(Email.received_at.desc())
-        .limit(min(limit, 100))
     )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)

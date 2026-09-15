@@ -1,5 +1,3 @@
-from datetime import datetime
-
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -19,7 +17,11 @@ async def get_emails(
     category: str | None = Query(
         None, description="primary | social | promotions | updates | forums"
     ),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int | None = Query(
+        None,
+        ge=1,
+        description="Maximum results. Omit for no limit (returns everything matching).",
+    ),
     db: Session = Depends(get_db)
 ) -> list[EmailOut]:
     """
@@ -30,10 +32,13 @@ async def get_emails(
     - sender: Filter by sender email
     - subject: Filter by subject line
     - category: Filter by Gmail category (primary/social/promotions/updates/forums)
-    - limit: Maximum results (1-200, default 50)
+    - limit: Maximum results. If omitted, all matching emails are returned.
     """
     try:
-        stmt = select(Email).order_by(Email.received_at.desc()).limit(limit)
+        stmt = select(Email).order_by(Email.received_at.desc())
+
+        if limit is not None:
+            stmt = stmt.limit(limit)
 
         if q:
             stmt = stmt.where(

@@ -16,8 +16,9 @@ from app.services.gmail_service import (
 
 logger = logging.getLogger(__name__)
 
-# Rate limiting constants
-INITIAL_SYNC_MESSAGE_LIMIT = 50  # Fetch only first 50 emails on initial sync
+# Small delay between individual Gmail API calls purely to stay under
+# Google's per-second rate limits. This is NOT a limit on how many
+# messages get imported — it just paces the calls.
 API_CALL_DELAY = 0.1  # 100ms delay between API calls to avoid rate limits
 
 
@@ -102,21 +103,18 @@ def initial_sync(
     gmail_service,
 ) -> int:
     """
-    Fetch the mailbox message list and store emails (with rate limiting).
+    Fetch the FULL mailbox message list and store every email
+    (rate-limited only by a small delay between calls, not by count).
 
     This runs after initial OAuth authorization or as recovery when a
     stored Gmail History ID becomes invalid.
-
-    Note: Limited to first 50 emails to avoid rate limit issues.
-    Future syncs use incremental_sync() which is more efficient.
     """
 
     imported_count = 0
     page_token = None
-    total_fetched = 0
 
     try:
-        while total_fetched < INITIAL_SYNC_MESSAGE_LIMIT:
+        while True:
             logger.info(f"Fetching messages page (imported so far: {imported_count})")
 
             response = list_messages(gmail_service, page_token)
@@ -127,12 +125,8 @@ def initial_sync(
                 break
 
             for item in messages:
-                if total_fetched >= INITIAL_SYNC_MESSAGE_LIMIT:
-                    logger.info(f"Reached initial sync limit of {INITIAL_SYNC_MESSAGE_LIMIT} messages")
-                    break
-
                 try:
-                    # Add delay to avoid rate limiting
+                    # Small delay to avoid hitting Gmail API rate limits
                     time.sleep(API_CALL_DELAY)
 
                     message = get_message(gmail_service, item["id"])
@@ -144,7 +138,6 @@ def initial_sync(
                     )
 
                     imported_count += 1
-                    total_fetched += 1
 
                 except Exception as e:
                     logger.warning(f"Failed to fetch message {item['id']}: {str(e)}")
@@ -156,10 +149,11 @@ def initial_sync(
 
             page_token = response.get("nextPageToken")
 
-            if not page_token or total_fetched >= INITIAL_SYNC_MESSAGE_LIMIT:
+            if not page_token:
                 break
 
-        # Get final profile and store history ID
+        # Get final profile and store history ID (anchors future
+        # incremental / pub-sub syncs)
         mailbox_profile = profile(gmail_service)
         account.history_id = str(mailbox_profile["historyId"])
         db.commit()
@@ -185,10 +179,13 @@ def incremental_sync(
     notification_history_id: str | None = None,
 ) -> int:
     """
-    Uses Gmail History API to retrieve new Gmail messages since the last
-    stored history ID.
+    Real-time sync driven by Gmail push notifications (Pub/Sub).
 
-    If Gmail rejects an old history ID, caller should run initial_sync.
+    Uses the Gmail History API to retrieve every new message since the
+    last stored history ID, paging through all results with no cap.
+
+    If Gmail rejects an old/expired history ID, caller falls back to a
+    full initial_sync.
     """
 
     if not account.history_id:
@@ -198,12 +195,15 @@ def incremental_sync(
     processed_message_ids: set[str] = set()
 
     try:
-        response = history(
-            gmail_service,
-            account.history_id,
-        )
+        page_token = None
 
         while True:
+            response = history(
+                gmail_service,
+                account.history_id,
+                page_token=page_token,
+            )
+
             for history_item in response.get("history", []):
                 for added in history_item.get("messagesAdded", []):
                     message_id = added["message"]["id"]
@@ -213,7 +213,7 @@ def incremental_sync(
 
                     processed_message_ids.add(message_id)
 
-                    # Add small delay
+                    # Small delay to avoid hitting Gmail API rate limits
                     time.sleep(API_CALL_DELAY)
 
                     message = get_message(gmail_service, message_id)
@@ -226,25 +226,24 @@ def incremental_sync(
 
                     imported_count += 1
 
-            next_page_token = response.get("nextPageToken")
+            page_token = response.get("nextPageToken")
 
-            if not next_page_token:
+            if not page_token:
+                # Advance the stored history ID once we've drained every page
+                account.history_id = str(
+                    notification_history_id
+                    or response.get("historyId")
+                    or account.history_id
+                )
                 break
 
-            response = gmail_service.users().history().list(
-                userId="me",
-                startHistoryId=account.history_id,
-                historyTypes=["messageAdded"],
-                pageToken=next_page_token,
-            ).execute()
-
-        account.history_id = str(
-            notification_history_id
-            or response.get("historyId")
-            or account.history_id
-        )
-
         db.commit()
+
+        logger.info(
+            "Incremental Gmail sync completed account=%s imported=%s",
+            account.google_email,
+            imported_count,
+        )
 
         return imported_count
 
@@ -265,7 +264,9 @@ def create_or_renew_watch(
     pubsub_topic: str,
 ) -> dict:
     """
-    Creates or renews Gmail Watch.
+    Creates or renews the Gmail Watch that powers real-time Pub/Sub push
+    notifications, so incremental_sync() gets triggered as new mail
+    arrives instead of relying on polling.
 
     Requires:
     - Gmail API enabled
