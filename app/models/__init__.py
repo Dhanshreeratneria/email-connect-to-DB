@@ -1,1 +1,1 @@
-from app.models.email import Email, EmailDelivery, GmailAccount
+from app.models.email import Email, EmailAttachment, EmailDelivery, GmailAccount

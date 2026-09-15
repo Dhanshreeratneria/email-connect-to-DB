@@ -22,6 +22,24 @@ class EmailOut(BaseModel):
         from_attributes = True
 
 
+class AttachmentOut(BaseModel):
+    """
+    Attachment metadata only — never the binary `content` column, so
+    listing an email's attachments stays small even when the file
+    itself (PDF/zip/image/etc.) is large. Fetch the actual bytes via
+    the separate /attachments/{attachment_id}/download endpoint.
+    """
+
+    id: int
+    gmail_attachment_id: str
+    filename: str
+    mime_type: str | None
+    size: int | None
+
+    class Config:
+        from_attributes = True
+
+
 class EmailDeliveryOut(BaseModel):
     account_id: int
     gmail_message_id: str

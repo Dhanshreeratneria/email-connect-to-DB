@@ -1,11 +1,13 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
     Integer,
     JSON,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -63,6 +65,9 @@ class Email(Base):
     deliveries: Mapped[list["EmailDelivery"]] = relationship(
         back_populates="email", cascade="all, delete-orphan"
     )
+    stored_attachments: Mapped[list["EmailAttachment"]] = relationship(
+        back_populates="email", cascade="all, delete-orphan"
+    )
 
 
 class EmailDelivery(Base):
@@ -91,3 +96,37 @@ class EmailDelivery(Base):
 
     email: Mapped["Email"] = relationship(back_populates="deliveries")
     account: Mapped["GmailAccount"] = relationship(back_populates="deliveries")
+
+
+class EmailAttachment(Base):
+    """
+    Actual binary content of one email attachment (PDF, image, zip, docx,
+    etc.), stored directly in Postgres as BYTEA via LargeBinary.
+
+    `Email.attachments` (JSON) keeps lightweight, always-present metadata
+    (filename/mime_type/size/gmail attachment id) parsed straight off the
+    Gmail payload. This table is populated afterwards, once per unique
+    attachment, by actually downloading the bytes from the Gmail API
+    (messages().attachments().get) — Gmail never inlines attachment bytes
+    in the message payload itself, only a reference to fetch them by id.
+    """
+
+    __tablename__ = "email_attachments"
+    __table_args__ = (
+        UniqueConstraint(
+            "email_id", "gmail_attachment_id", name="uq_email_gmail_attachment"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email_id: Mapped[int] = mapped_column(
+        ForeignKey("emails.id", ondelete="CASCADE"), index=True
+    )
+    gmail_attachment_id: Mapped[str] = mapped_column(String(512))
+    filename: Mapped[str] = mapped_column(String(1024))
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    content: Mapped[bytes | None] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    email: Mapped["Email"] = relationship(back_populates="stored_attachments")

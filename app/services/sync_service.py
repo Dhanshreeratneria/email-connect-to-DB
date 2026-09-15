@@ -4,9 +4,10 @@ import time
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models.email import Email, EmailDelivery, GmailAccount
-from app.services.email_parser import parse_message
+from app.models.email import Email, EmailAttachment, EmailDelivery, GmailAccount
+from app.services.email_parser import decode_base64_urlsafe_bytes, parse_message
 from app.services.gmail_service import (
+    get_attachment,
     get_message,
     history,
     list_messages,
@@ -22,10 +23,70 @@ logger = logging.getLogger(__name__)
 API_CALL_DELAY = 0.1  # 100ms delay between API calls to avoid rate limits
 
 
+def store_attachments(
+    db: Session,
+    email: Email,
+    gmail_service,
+    gmail_message_id: str,
+    attachments_meta: list[dict],
+) -> None:
+    """
+    Downloads and stores the actual bytes for any attachment listed in
+    Email.attachments (parsed metadata) that isn't already saved in the
+    email_attachments table, so PDFs/zips/images/etc. end up persisted
+    in the database rather than just their filename/size/mime_type.
+
+    Safe to call every time an already-stored email is seen again
+    (e.g. the same email delivered to a second connected account) —
+    existing (email_id, gmail_attachment_id) rows are skipped.
+    """
+
+    for meta in attachments_meta:
+        attachment_id = meta.get("attachment_id")
+
+        if not attachment_id:
+            continue
+
+        already_stored = db.scalar(
+            select(EmailAttachment).where(
+                EmailAttachment.email_id == email.id,
+                EmailAttachment.gmail_attachment_id == attachment_id,
+            )
+        )
+
+        if already_stored:
+            continue
+
+        try:
+            time.sleep(API_CALL_DELAY)
+            raw = get_attachment(gmail_service, gmail_message_id, attachment_id)
+            content = decode_base64_urlsafe_bytes(raw.get("data", ""))
+
+        except Exception:
+            logger.exception(
+                "Failed to download attachment %s for message %s",
+                attachment_id,
+                gmail_message_id,
+            )
+            continue
+
+        db.add(
+            EmailAttachment(
+                email_id=email.id,
+                gmail_attachment_id=attachment_id,
+                filename=meta.get("filename") or "attachment",
+                mime_type=meta.get("mime_type"),
+                size=raw.get("size") or meta.get("size"),
+                content=content,
+            )
+        )
+
+
 def record_email_delivery(
     db: Session,
     account: GmailAccount,
     gmail_message: dict,
+    gmail_service=None,
 ) -> Email:
     """
     Store (or link to) an email exactly once by its RFC Message-ID header,
@@ -85,6 +146,15 @@ def record_email_delivery(
         db.add(email)
         db.flush()  # populate email.id before creating the delivery row
 
+    if gmail_service is not None and parsed.get("attachments"):
+        store_attachments(
+            db=db,
+            email=email,
+            gmail_service=gmail_service,
+            gmail_message_id=gmail_message_id,
+            attachments_meta=parsed["attachments"],
+        )
+
     delivery = EmailDelivery(
         email_id=email.id,
         account_id=account.id,
@@ -135,6 +205,7 @@ def initial_sync(
                         db=db,
                         account=account,
                         gmail_message=message,
+                        gmail_service=gmail_service,
                     )
 
                     imported_count += 1
@@ -222,6 +293,7 @@ def incremental_sync(
                         db=db,
                         account=account,
                         gmail_message=message,
+                        gmail_service=gmail_service,
                     )
 
                     imported_count += 1

@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models.email import Email, EmailDelivery
-from app.schemas.email import EmailDeliveryOut, EmailOut
+from app.models.email import Email, EmailAttachment, EmailDelivery
+from app.schemas.email import AttachmentOut, EmailDeliveryOut, EmailOut
 
 router = APIRouter()
 
@@ -120,3 +121,69 @@ async def get_email_deliveries(
         )
 
     return delivery.email.deliveries
+
+
+@router.get(
+    "/emails/{message_id}/attachments", response_model=list[AttachmentOut]
+)
+async def get_email_attachments(
+    message_id: str,
+    db: Session = Depends(get_db),
+) -> list[AttachmentOut]:
+    """
+    List attachment metadata (filename/mime_type/size) for an email,
+    identified by Gmail message ID. Does NOT return file bytes — use
+    /emails/{message_id}/attachments/{attachment_id}/download for that.
+    """
+    delivery = db.scalar(
+        select(EmailDelivery).where(EmailDelivery.gmail_message_id == message_id)
+    )
+
+    if not delivery:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Email with message_id '{message_id}' not found",
+        )
+
+    return delivery.email.stored_attachments
+
+
+@router.get("/emails/{message_id}/attachments/{attachment_id}/download")
+async def download_email_attachment(
+    message_id: str,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+) -> Response:
+    """
+    Streams the stored attachment's raw bytes back with its original
+    mime type and filename, so the browser/client can open or save it
+    as a PDF, zip, image, etc. `attachment_id` here is the internal
+    email_attachments.id (from the list endpoint above), not Gmail's ID.
+    """
+    delivery = db.scalar(
+        select(EmailDelivery).where(EmailDelivery.gmail_message_id == message_id)
+    )
+
+    if not delivery:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Email with message_id '{message_id}' not found",
+        )
+
+    attachment = db.scalar(
+        select(EmailAttachment).where(
+            EmailAttachment.id == attachment_id,
+            EmailAttachment.email_id == delivery.email_id,
+        )
+    )
+
+    if not attachment or attachment.content is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    return Response(
+        content=attachment.content,
+        media_type=attachment.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{attachment.filename}"'
+        },
+    )

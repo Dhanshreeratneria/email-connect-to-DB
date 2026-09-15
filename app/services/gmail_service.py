@@ -6,3 +6,4 @@ def get_message(service,message_id:str): return service.users().messages().get(u
 def list_messages(service,page_token=None): return service.users().messages().list(userId="me",maxResults=500,pageToken=page_token).execute()
 def history(service,start_history_id:str): return service.users().history().list(userId="me",startHistoryId=start_history_id,historyTypes=["messageAdded"]).execute()
 def watch(service,topic:str): return service.users().watch(userId="me",body={"topicName":topic,"labelIds":["INBOX"]}).execute()
+def get_attachment(service,message_id:str,attachment_id:str): return service.users().messages().attachments().get(userId="me",messageId=message_id,id=attachment_id).execute()

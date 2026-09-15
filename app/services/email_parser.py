@@ -41,6 +41,21 @@ def decode_base64_urlsafe(value: str) -> str:
     ).decode("utf-8", errors="replace")
 
 
+def decode_base64_urlsafe_bytes(value: str) -> bytes:
+    """
+    Same URL-safe Base64 padding fix as decode_base64_urlsafe(), but
+    returns raw bytes instead of decoding as text. Use this for binary
+    attachment content (PDF/zip/image/etc.) — text decoding would
+    corrupt non-text bytes.
+    """
+    if not value:
+        return b""
+
+    padded_value = value + "=" * (-len(value) % 4)
+
+    return base64.urlsafe_b64decode(padded_value.encode("utf-8"))
+
+
 def parse_received_at(message: dict[str, Any], headers: dict[str, str]) -> datetime:
     date_header = headers.get("date")
 
