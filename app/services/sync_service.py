@@ -2,6 +2,7 @@ import logging
 import time
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.models.email import Email, EmailAttachment, EmailDelivery, GmailAccount
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 # messages get imported — it just paces the calls.
 API_CALL_DELAY = 0.1  # 100ms delay between API calls to avoid rate limits
 
+# Matches the column definitions in EmailAttachment — truncate here so a
+# freak long filename/mime_type never raises a DataError at insert time.
+MAX_FILENAME_LEN = 1024
+MAX_MIME_TYPE_LEN = 255
+
 
 def store_attachments(
     db: Session,
@@ -39,6 +45,13 @@ def store_attachments(
     Safe to call every time an already-stored email is seen again
     (e.g. the same email delivered to a second connected account) —
     existing (email_id, gmail_attachment_id) rows are skipped.
+
+    Every insert runs inside its own SAVEPOINT (db.begin_nested()). If
+    one attachment fails to insert — a duplicate slipping in from a
+    race condition, a DB constraint error, a connection blip — only
+    that savepoint rolls back. The outer transaction (the email +
+    delivery rows, plus every other attachment already added) is left
+    intact, so one bad attachment can't sink the whole sync batch.
     """
 
     for meta in attachments_meta:
@@ -70,16 +83,34 @@ def store_attachments(
             )
             continue
 
-        db.add(
-            EmailAttachment(
-                email_id=email.id,
-                gmail_attachment_id=attachment_id,
-                filename=meta.get("filename") or "attachment",
-                mime_type=meta.get("mime_type"),
-                size=raw.get("size") or meta.get("size"),
-                content=content,
+        filename = (meta.get("filename") or "attachment")[:MAX_FILENAME_LEN]
+        mime_type = meta.get("mime_type")
+
+        if mime_type:
+            mime_type = mime_type[:MAX_MIME_TYPE_LEN]
+
+        try:
+            with db.begin_nested():  # SAVEPOINT — isolates this one insert
+                db.add(
+                    EmailAttachment(
+                        email_id=email.id,
+                        gmail_attachment_id=attachment_id,
+                        filename=filename,
+                        mime_type=mime_type,
+                        size=raw.get("size") or meta.get("size"),
+                        content=content,
+                    )
+                )
+                db.flush()  # force the insert now, inside the savepoint
+
+        except SQLAlchemyError:
+            logger.exception(
+                "Failed to store attachment %s for email_id=%s — "
+                "skipping just this attachment, rest of the sync continues",
+                attachment_id,
+                email.id,
             )
-        )
+            continue
 
 
 def record_email_delivery(
