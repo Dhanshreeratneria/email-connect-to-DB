@@ -243,7 +243,8 @@ def initial_sync(
 
                 except Exception as e:
                     logger.warning(f"Failed to fetch message {item['id']}: {str(e)}")
-                    # Continue with next message instead of failing
+                    db.rollback()  # clear the aborted-transaction state so
+                    # the NEXT message's queries don't fail too
                     continue
 
             # Commit after each page
@@ -315,19 +316,29 @@ def incremental_sync(
 
                     processed_message_ids.add(message_id)
 
-                    # Small delay to avoid hitting Gmail API rate limits
-                    time.sleep(API_CALL_DELAY)
+                    try:
+                        # Small delay to avoid hitting Gmail API rate limits
+                        time.sleep(API_CALL_DELAY)
 
-                    message = get_message(gmail_service, message_id)
+                        message = get_message(gmail_service, message_id)
 
-                    record_email_delivery(
-                        db=db,
-                        account=account,
-                        gmail_message=message,
-                        gmail_service=gmail_service,
-                    )
+                        record_email_delivery(
+                            db=db,
+                            account=account,
+                            gmail_message=message,
+                            gmail_service=gmail_service,
+                        )
 
-                    imported_count += 1
+                        imported_count += 1
+
+                    except Exception:
+                        logger.exception(
+                            "Failed to import message %s during incremental sync",
+                            message_id,
+                        )
+                        db.rollback()  # clear aborted-transaction state so
+                        # remaining messages in this batch still save
+                        continue
 
             page_token = response.get("nextPageToken")
 
