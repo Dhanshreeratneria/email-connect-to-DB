@@ -361,3 +361,17 @@ def create_or_renew_watch(
     db.commit()
 
     return result
+
+def renew_watch(
+    db: Session,
+    account: GmailAccount,
+    gmail_service,
+    pubsub_topic: str,
+) -> dict:
+    """Renew an existing Gmail Watch and persist its new history/expiry."""
+    return create_or_renew_watch(
+        db=db,
+        account=account,
+        gmail_service=gmail_service,
+        pubsub_topic=pubsub_topic,
+    )

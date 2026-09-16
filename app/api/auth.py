@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import RedirectResponse
@@ -14,7 +14,7 @@ from app.services.oauth_service import (
     encrypt_credentials,
     exchange,
 )
-from app.services.sync_service import initial_sync, create_or_renew_watch
+from app.services.sync_service import create_or_renew_watch, initial_sync
 
 logger = logging.getLogger(__name__)
 
@@ -78,21 +78,26 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
         initial_sync(db, account, service)
         logger.info("Initial Gmail sync completed for account=%s", google_email)
 
-        watch_status = "not enabled"
-        try:
-            create_or_renew_watch(db, account, service, settings.google_pubsub_topic)
-            watch_status = "enabled"
-            logger.info("Gmail watch enabled for account=%s", google_email)
-        except Exception:
-            # Don't fail the whole OAuth flow if Pub/Sub isn't configured yet
-            # (e.g. topic/permissions not set up). The account is still
-            # connected and searchable; live sync just won't work until
-            # this succeeds.
-            logger.exception(
-                "Failed to create Gmail watch for account=%s — live sync "
-                "will not work until Pub/Sub is configured correctly.",
-                google_email,
-            )
+        # Start Gmail push notifications after the initial sync. The watch
+        # response gives us the historyId from which future incremental syncs
+        # must start. This is what connects Gmail -> Pub/Sub -> webhook.
+        logger.info(
+            "Creating Gmail Watch account=%s topic=%s",
+            google_email,
+            settings.google_pubsub_topic,
+        )
+        create_or_renew_watch(
+            db=db,
+            account=account,
+            gmail_service=service,
+            pubsub_topic=settings.google_pubsub_topic,
+        )
+        logger.info(
+            "Gmail Watch enabled account=%s history_id=%s expiration=%s",
+            google_email,
+            account.history_id,
+            account.watch_expiration,
+        )
 
         if pending is not None:
             auth_code = connector_auth.issue_auth_code(pending, google_email)
@@ -103,14 +108,10 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
             "status": "connected",
             "google_email": google_email,
             "initial_sync": "completed",
-            "gmail_watch": watch_status,
-            "next_step": (
-                "Live sync is active."
-                if watch_status == "enabled"
-                else "Check logs: Gmail watch failed, likely a Pub/Sub "
-                "topic/permission issue. New mail will not sync until "
-                "this is fixed."
-            ),
+            "gmail_watch": "enabled",
+            "watch_history_id": account.history_id,
+            "watch_expiration": account.watch_expiration.isoformat() if account.watch_expiration else None,
+            "pubsub_topic": settings.google_pubsub_topic,
         }
 
     except Exception as exc:
