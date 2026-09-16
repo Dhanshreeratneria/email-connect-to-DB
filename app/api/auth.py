@@ -14,7 +14,7 @@ from app.services.oauth_service import (
     encrypt_credentials,
     exchange,
 )
-from app.services.sync_service import initial_sync
+from app.services.sync_service import initial_sync, create_or_renew_watch
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,22 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
         initial_sync(db, account, service)
         logger.info("Initial Gmail sync completed for account=%s", google_email)
 
+        watch_status = "not enabled"
+        try:
+            create_or_renew_watch(db, account, service, settings.google_pubsub_topic)
+            watch_status = "enabled"
+            logger.info("Gmail watch enabled for account=%s", google_email)
+        except Exception:
+            # Don't fail the whole OAuth flow if Pub/Sub isn't configured yet
+            # (e.g. topic/permissions not set up). The account is still
+            # connected and searchable; live sync just won't work until
+            # this succeeds.
+            logger.exception(
+                "Failed to create Gmail watch for account=%s — live sync "
+                "will not work until Pub/Sub is configured correctly.",
+                google_email,
+            )
+
         if pending is not None:
             auth_code = connector_auth.issue_auth_code(pending, google_email)
             redirect_url = f"{pending['redirect_uri']}?code={auth_code}&state={pending['state']}"
@@ -87,8 +103,14 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
             "status": "connected",
             "google_email": google_email,
             "initial_sync": "completed",
-            "gmail_watch": "not enabled yet",
-            "next_step": "Configure Pub/Sub, then enable Gmail Watch.",
+            "gmail_watch": watch_status,
+            "next_step": (
+                "Live sync is active."
+                if watch_status == "enabled"
+                else "Check logs: Gmail watch failed, likely a Pub/Sub "
+                "topic/permission issue. New mail will not sync until "
+                "this is fixed."
+            ),
         }
 
     except Exception as exc:

@@ -1,39 +1,96 @@
-from fastapi import APIRouter, Request, Depends  # ← Add Depends!
-from sqlalchemy.orm import Session
-from app.database import get_db
-import logging
 import base64
 import json
+import logging
+
+from fastapi import APIRouter, Request, Depends
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.email import GmailAccount
+from app.services.gmail_service import gmail
+from app.services.oauth_service import decrypt_credentials
+from app.services.sync_service import incremental_sync
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/webhook", tags=["webhook"])
 
-@router.post("/gmail")
+# NOTE: this path must exactly match the push endpoint registered on the
+# Pub/Sub subscription (see README "Pub/Sub setup") and the
+# GOOGLE_PUBSUB_AUDIENCE value in your environment, e.g.
+#   https://YOUR-DOMAIN/webhooks/google/pubsub
+router = APIRouter(prefix="/webhooks/google", tags=["webhook"])
+
+
+@router.post("/pubsub")
 async def gmail_webhook(request: Request, db: Session = Depends(get_db)):
     """
-    Receives Pub/Sub push notifications from Gmail Watch.
-    Google sends: {"message": {"data": "base64-encoded-string"}}
+    Receives Pub/Sub push notifications from the Gmail Watch.
+
+    Google sends: {"message": {"data": "<base64 JSON>"}}
+    where the decoded JSON is {"emailAddress": "...", "historyId": "..."}.
+
+    This identifies which connected account changed and runs an
+    incremental sync so new mail actually lands in Postgres.
     """
     try:
         body = await request.json()
-        logger.info(f"Webhook received: {body}")
-        
-        # Pub/Sub sends the message in this format
-        if "message" in body:
-            message = body["message"]
-            
-            # Data is base64 encoded
-            if "data" in message:
-                data_str = base64.b64decode(message["data"]).decode()
-                data = json.loads(data_str)
-                logger.info(f"Gmail notification: {data}")
-                
-                # Trigger email sync here
-                # You can resync the mailbox
-        
-        # IMPORTANT: Return 200 OK so Pub/Sub knows message was received
+    except Exception:
+        logger.exception("Webhook payload was not valid JSON")
+        return {"error": "invalid payload"}, 400
+
+    message = body.get("message") or {}
+    data_b64 = message.get("data")
+
+    if not data_b64:
+        logger.warning("Webhook received with no message.data: %s", body)
+        # Still 200 so Pub/Sub doesn't retry a malformed/test message forever.
         return {"status": "ok"}
-        
-    except Exception as e:
-        logger.exception("Webhook error")
-        return {"error": str(e)}, 400
+
+    try:
+        data = json.loads(base64.b64decode(data_b64).decode())
+    except Exception:
+        logger.exception("Failed to decode Pub/Sub message.data")
+        return {"status": "ok"}
+
+    email_address = data.get("emailAddress")
+    notification_history_id = data.get("historyId")
+    logger.info(
+        "Gmail notification for %s (historyId=%s)",
+        email_address,
+        notification_history_id,
+    )
+
+    if not email_address:
+        logger.warning("Notification missing emailAddress: %s", data)
+        return {"status": "ok"}
+
+    account = (
+        db.query(GmailAccount)
+        .filter(GmailAccount.google_email == email_address)
+        .first()
+    )
+
+    if account is None:
+        logger.warning("Notification for unknown account: %s", email_address)
+        return {"status": "ok"}
+
+    try:
+        credentials = decrypt_credentials(account.encrypted_token)
+        service = gmail(credentials)
+
+        imported = incremental_sync(
+            db=db,
+            account=account,
+            gmail_service=service,
+            notification_history_id=notification_history_id,
+        )
+        logger.info(
+            "Webhook-triggered sync imported %s message(s) for %s",
+            imported,
+            email_address,
+        )
+    except Exception:
+        # Always return 200 so Pub/Sub doesn't hammer us with retries;
+        # the failure is logged for investigation instead.
+        logger.exception("Webhook-triggered sync failed for %s", email_address)
+
+    return {"status": "ok"}
