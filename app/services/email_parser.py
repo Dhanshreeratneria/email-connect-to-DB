@@ -101,6 +101,99 @@ def extract_addresses(header_value: str) -> list[str]:
     ]
 
 
+def build_recipients(headers: dict[str, str]) -> list[dict[str, str | None]]:
+    """
+    Parses the To/Cc/Bcc headers into a structured recipient list, each
+    entry tagged with its "type" ("to" | "cc" | "bcc") plus the
+    recipient's display name and lowercased email address.
+
+    This replaces the old behaviour of naively splitting the header
+    strings on "," into one flat, untyped list — which both lost the
+    to/cc/bcc distinction and mishandled display names containing a
+    comma (e.g. 'Doe, Jane <jane@example.com>'), since getaddresses()
+    parses each header value as a proper RFC 2822 address list instead.
+
+    Note: Gmail never includes the Bcc header on a message as delivered
+    to any of its recipients — it's only present when reading a
+    message directly from the sender's own Sent items. So a "bcc"
+    entry will only ever show up there, not on a received copy.
+    """
+    recipients: list[dict[str, str | None]] = []
+
+    for header_name in ("to", "cc", "bcc"):
+        header_value = headers.get(header_name, "")
+
+        if not header_value:
+            continue
+
+        for name, addr in getaddresses([header_value]):
+            addr = (addr or "").strip().lower()
+
+            if not addr:
+                continue
+
+            recipients.append(
+                {
+                    "name": name.strip() or None,
+                    "email": addr,
+                    "type": header_name,
+                }
+            )
+
+    return recipients
+
+
+# Maps a MIME subtype (the part after "/") to a short, human-friendly
+# attachment type. Subtypes not listed here fall back to the MIME
+# top-level type (image/video/audio/text) or "other".
+ATTACHMENT_MIME_SUBTYPE_MAP = {
+    "pdf": "pdf",
+    "zip": "archive",
+    "x-zip-compressed": "archive",
+    "x-rar-compressed": "archive",
+    "x-7z-compressed": "archive",
+    "gzip": "archive",
+    "x-gzip": "archive",
+    "x-tar": "archive",
+    "msword": "document",
+    "vnd.openxmlformats-officedocument.wordprocessingml.document": "document",
+    "vnd.oasis.opendocument.text": "document",
+    "rtf": "document",
+    "vnd.ms-excel": "spreadsheet",
+    "vnd.openxmlformats-officedocument.spreadsheetml.sheet": "spreadsheet",
+    "vnd.oasis.opendocument.spreadsheet": "spreadsheet",
+    "csv": "spreadsheet",
+    "vnd.ms-powerpoint": "presentation",
+    "vnd.openxmlformats-officedocument.presentationml.presentation": "presentation",
+    "vnd.oasis.opendocument.presentation": "presentation",
+    "json": "data",
+    "xml": "data",
+}
+
+
+def classify_attachment_type(mime_type: str | None) -> str:
+    """
+    Derives a short, human-friendly attachment type ("image", "pdf",
+    "document", "spreadsheet", "presentation", "archive", "video",
+    "audio", "text", "data", or "other") from a raw MIME type, so
+    callers don't have to pattern-match "application/vnd.openxml..."
+    strings themselves.
+    """
+    if not mime_type or "/" not in mime_type:
+        return "other"
+
+    primary, _, subtype = mime_type.lower().partition("/")
+    subtype = subtype.split(";", 1)[0].strip()
+
+    if primary in ("image", "video", "audio"):
+        return primary
+
+    if primary == "text":
+        return ATTACHMENT_MIME_SUBTYPE_MAP.get(subtype, "text")
+
+    return ATTACHMENT_MIME_SUBTYPE_MAP.get(subtype, "other")
+
+
 def parse_message(message: dict[str, Any]) -> dict[str, Any]:
     """
     Converts Gmail API messages.get(format='full') payload into
@@ -111,7 +204,7 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
     - RFC Message-ID header (stable across every recipient's copy
       of the same email, used to dedupe across connected accounts)
     - Sender
-    - To/CC/BCC recipients (display list)
+    - To/CC/BCC recipients, each tagged with its type (display list)
     - Subject
     - Plain-text MIME body
     - Labels + derived category (primary/social/promotions/updates/forums)
@@ -133,17 +226,7 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
 
     sender_name, sender_email = parseaddr(headers.get("from", ""))
 
-    recipients: list[str] = []
-
-    for header_name in ("to", "cc", "bcc"):
-        header_value = headers.get(header_name, "")
-
-        if header_value:
-            recipients.extend(
-                item.strip()
-                for item in header_value.split(",")
-                if item.strip()
-            )
+    recipients = build_recipients(headers)
 
     plain_text_parts: list[str] = []
     html_parts: list[str] = []
@@ -161,6 +244,7 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
                 {
                     "filename": filename,
                     "mime_type": mime_type,
+                    "type": classify_attachment_type(mime_type),
                     "attachment_id": attachment_id,
                     "size": body.get("size", 0),
                 }
@@ -203,7 +287,9 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
         "category": categorize(label_ids),
         "has_attachments": len(attachments) > 0,
         "attachments": attachments,
-        # Extra, non-column fields for delivery-type detection:
-        "to_addresses": extract_addresses(headers.get("to", "")),
-        "cc_addresses": extract_addresses(headers.get("cc", "")),
+        # Extra, non-column fields for delivery-type detection. Derived
+        # from the same `recipients` list above so there's one source
+        # of truth for who's To/Cc — not re-parsed separately.
+        "to_addresses": [r["email"] for r in recipients if r["type"] == "to"],
+        "cc_addresses": [r["email"] for r in recipients if r["type"] == "cc"],
     }

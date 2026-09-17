@@ -9,20 +9,52 @@ mcp = FastMCP(
     instructions="Read-only email search. Never expose OAuth tokens or secrets."
 )
 
+def group_recipients(recipients: list) -> dict[str, list[dict[str, str | None]]]:
+    """
+    Groups the stored recipients list by delivery type ("to"/"cc"/"bcc")
+    so callers get a ready-to-use breakdown instead of a flat list they
+    have to filter themselves.
+
+    Tolerates rows synced before recipients carried a "type" (older data
+    stored as plain email strings) by bucketing those under "unknown"
+    rather than dropping or mis-tagging them.
+    """
+    grouped: dict[str, list[dict[str, str | None]]] = {
+        "to": [], "cc": [], "bcc": [], "unknown": []
+    }
+
+    for r in recipients or []:
+        if isinstance(r, dict) and r.get("type") in ("to", "cc", "bcc"):
+            grouped[r["type"]].append(r)
+        elif isinstance(r, dict):
+            grouped["unknown"].append(r)
+        else:
+            grouped["unknown"].append({"name": None, "email": r, "type": None})
+
+    return grouped
+
+
 def serialize(e: Email):
+    recipients = group_recipients(e.recipients)
+
     return {
         "id": e.id,
         "rfc_message_id": e.rfc_message_id,
         "thread_id": e.thread_id,
         "sender_name": e.sender_name,
         "sender_email": e.sender_email,
-        "recipients": e.recipients,
+        "recipients": recipients,
+        "recipient_count": sum(len(v) for v in recipients.values()),
         "subject": e.subject,
         "body_text": e.body_text,
         "received_at": e.received_at.isoformat(),
         "labels": e.labels,
         "category": e.category,
         "has_attachments": e.has_attachments,
+        # Each attachment dict already carries a short "type" (image,
+        # pdf, document, spreadsheet, archive, ...) derived from its
+        # mime_type by email_parser.classify_attachment_type, in
+        # addition to the raw mime_type itself.
         "attachments": e.attachments,
     }
 
