@@ -1,43 +1,15 @@
-import base64
 from datetime import datetime
-
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
-
 from app.database import SessionLocal
-from app.models.email import Email, EmailDelivery, EmailAttachment
-from app.services.gmail_service import gmail, get_attachment
-from app.services.auth_service import decrypt_credentials
-from app.utils.gmail import decode_base64_urlsafe_bytes
+from app.models.email import Email, EmailDelivery
 
 mcp = FastMCP(
     "Gmail Email Search",
     instructions="Read-only email search. Never expose OAuth tokens or secrets."
 )
 
-
 def serialize(e: Email):
-    """Serialize email including attachment metadata."""
-    attachments = []
-
-    # Get attachment records stored in PostgreSQL
-    if hasattr(e, "stored_attachments"):
-        for attachment in e.stored_attachments:
-            attachments.append({
-                "id": attachment.id,
-                "gmail_attachment_id": attachment.gmail_attachment_id,
-                "filename": attachment.filename,
-                "mime_type": attachment.mime_type,
-                "size": attachment.size,
-                "stored_in_postgresql": attachment.content is not None,
-                "content_available": attachment.content is not None,
-                "stored_content_size": (
-                    len(attachment.content)
-                    if attachment.content is not None
-                    else 0
-                ),
-            })
-
     return {
         "id": e.id,
         "rfc_message_id": e.rfc_message_id,
@@ -51,9 +23,8 @@ def serialize(e: Email):
         "labels": e.labels,
         "category": e.category,
         "has_attachments": e.has_attachments,
-        "attachments": attachments,
+        "attachments": e.attachments,
     }
-
 
 def query(stmt):
     db = SessionLocal()
@@ -62,16 +33,10 @@ def query(stmt):
     finally:
         db.close()
 
-
 @mcp.tool()
-def search_emails(
-    query_text: str,
-    limit: int | None = None
-) -> list[dict]:
+def search_emails(query_text: str, limit: int | None = None) -> list[dict]:
     """Search sender, subject, and text body. Omit limit for all matches."""
-
     q = f"%{query_text}%"
-
     stmt = (
         select(Email)
         .where(
@@ -83,18 +48,84 @@ def search_emails(
         )
         .order_by(Email.received_at.desc())
     )
-
     if limit is not None:
         stmt = stmt.limit(limit)
-
     return query(stmt)
-
 
 @mcp.tool()
 def get_email(gmail_message_id: str) -> dict | None:
-    """Get one stored email by its Gmail message ID."""
-
+    """Get one stored email by its Gmail message ID (per-inbox id)."""
     db = SessionLocal()
-
     try:
-        delivery = db
+        delivery = db.scalar(
+            select(EmailDelivery).where(
+                EmailDelivery.gmail_message_id == gmail_message_id
+            )
+        )
+        return serialize(delivery.email) if delivery else None
+    finally:
+        db.close()
+
+@mcp.tool()
+def list_emails(limit: int | None = None) -> list[dict]:
+    """List all emails, most recent first. Omit limit for everything."""
+    stmt = select(Email).order_by(Email.received_at.desc())
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
+
+@mcp.tool()
+def list_emails_by_category(
+    category: str, limit: int | None = None
+) -> list[dict]:
+    """category: primary | social | promotions | updates | forums"""
+    stmt = (
+        select(Email)
+        .where(Email.category == category.lower())
+        .order_by(Email.received_at.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
+
+@mcp.tool()
+def get_thread(thread_id: str) -> list[dict]:
+    return query(
+        select(Email).where(Email.thread_id == thread_id).order_by(Email.received_at)
+    )
+
+@mcp.tool()
+def search_by_sender(sender: str, limit: int | None = None) -> list[dict]:
+    stmt = (
+        select(Email)
+        .where(Email.sender_email.ilike(f"%{sender}%"))
+        .order_by(Email.received_at.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
+
+@mcp.tool()
+def search_by_subject(subject: str, limit: int | None = None) -> list[dict]:
+    stmt = (
+        select(Email)
+        .where(Email.subject.ilike(f"%{subject}%"))
+        .order_by(Email.received_at.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
+
+@mcp.tool()
+def search_by_date(start_iso: str, end_iso: str, limit: int | None = None) -> list[dict]:
+    stmt = (
+        select(Email)
+        .where(
+            Email.received_at >= datetime.fromisoformat(start_iso),
+            Email.received_at <= datetime.fromisoformat(end_iso),
+        )
+        .order_by(Email.received_at.desc())
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return query(stmt)
