@@ -14,7 +14,7 @@ from app.services.oauth_service import (
     encrypt_credentials,
     exchange,
 )
-from app.services.sync_service import create_or_renew_watch, initial_sync
+from app.services.sync_service import watch_mailbox, initial_sync
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ def callback(code: str, state: str = None, db: Session = Depends(get_db)):
                 google_email,
                 settings.google_pubsub_topic,
             )
-            create_or_renew_watch(
+            watch_mailbox(
                 db=db,
                 account=account,
                 gmail_service=service,
