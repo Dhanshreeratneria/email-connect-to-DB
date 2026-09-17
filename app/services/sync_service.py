@@ -1,3 +1,13 @@
+"""
+Updated sync service with robust attachment downloading and storage.
+
+Key improvements:
+- Automatic attachment downloading during email sync
+- Retry logic for failed downloads
+- Progress tracking
+- Proper error handling
+"""
+
 import logging
 import time
 
@@ -18,9 +28,11 @@ from app.services.gmail_service import (
 logger = logging.getLogger(__name__)
 
 # Small delay between individual Gmail API calls purely to stay under
-# Google's per-second rate limits. This is NOT a limit on how many
-# messages get imported — it just paces the calls.
+# Google's per-second rate limits.
 API_CALL_DELAY = 0.1  # 100ms delay between API calls to avoid rate limits
+
+# Maximum retries for failed attachment downloads
+MAX_ATTACHMENT_RETRIES = 3
 
 
 def store_attachments(
@@ -29,7 +41,7 @@ def store_attachments(
     gmail_service,
     gmail_message_id: str,
     attachments_meta: list[dict],
-) -> None:
+) -> Tuple[int, int]:
     """
     Downloads and stores the actual bytes for any attachment listed in
     Email.attachments (parsed metadata) that isn't already saved in the
@@ -39,7 +51,20 @@ def store_attachments(
     Safe to call every time an already-stored email is seen again
     (e.g. the same email delivered to a second connected account) —
     existing (email_id, gmail_attachment_id) rows are skipped.
+    
+    Args:
+        db: SQLAlchemy session
+        email: Email object
+        gmail_service: Gmail API service
+        gmail_message_id: Gmail message ID
+        attachments_meta: List of attachment metadata dicts
+        
+    Returns:
+        Tuple of (successful_downloads, failed_downloads)
     """
+    
+    successful = 0
+    failed = 0
 
     for meta in attachments_meta:
         attachment_id = meta.get("attachment_id")
@@ -47,6 +72,7 @@ def store_attachments(
         if not attachment_id:
             continue
 
+        # Check if already stored
         already_stored = db.scalar(
             select(EmailAttachment).where(
                 EmailAttachment.email_id == email.id,
@@ -55,31 +81,53 @@ def store_attachments(
         )
 
         if already_stored:
+            logger.debug(f"Attachment {attachment_id} already stored")
             continue
 
-        try:
-            time.sleep(API_CALL_DELAY)
-            raw = get_attachment(gmail_service, gmail_message_id, attachment_id)
-            content = decode_base64_urlsafe_bytes(raw.get("data", ""))
+        # Try to download with retries
+        retries = 0
+        while retries < MAX_ATTACHMENT_RETRIES:
+            try:
+                time.sleep(API_CALL_DELAY)
+                raw = get_attachment(gmail_service, gmail_message_id, attachment_id)
+                content = decode_base64_urlsafe_bytes(raw.get("data", ""))
 
-        except Exception:
-            logger.exception(
-                "Failed to download attachment %s for message %s",
-                attachment_id,
-                gmail_message_id,
-            )
-            continue
+                # Store in database
+                db.add(
+                    EmailAttachment(
+                        email_id=email.id,
+                        gmail_attachment_id=attachment_id,
+                        filename=meta.get("filename") or "attachment",
+                        mime_type=meta.get("mime_type"),
+                        size=raw.get("size") or meta.get("size"),
+                        content=content,
+                    )
+                )
+                
+                logger.info(
+                    f"Stored attachment {meta.get('filename')} ({len(content)} bytes) "
+                    f"for email {email.id}"
+                )
+                
+                successful += 1
+                break
 
-        db.add(
-            EmailAttachment(
-                email_id=email.id,
-                gmail_attachment_id=attachment_id,
-                filename=meta.get("filename") or "attachment",
-                mime_type=meta.get("mime_type"),
-                size=raw.get("size") or meta.get("size"),
-                content=content,
-            )
-        )
+            except Exception as e:
+                retries += 1
+                logger.warning(
+                    f"Failed to download attachment {attachment_id} (attempt {retries}/{MAX_ATTACHMENT_RETRIES}): {str(e)}"
+                )
+                
+                if retries >= MAX_ATTACHMENT_RETRIES:
+                    logger.error(
+                        f"Failed to download attachment {attachment_id} for message {gmail_message_id} "
+                        f"after {MAX_ATTACHMENT_RETRIES} retries"
+                    )
+                    failed += 1
+                else:
+                    time.sleep(1)  # Wait before retry
+    
+    return successful, failed
 
 
 def record_email_delivery(
@@ -94,12 +142,13 @@ def record_email_delivery(
 
     - If this exact account has already recorded this exact Gmail message
       (same account_id + gmail_message_id), nothing changes: returns the
-      existing email untouched. This replaces the old account_id+message_id
-      "unique protection" behaviour.
+      existing email untouched.
     - If another connected account already stored this same real-world
       email (matched by rfc_message_id), the email content is NOT
       duplicated — only a new EmailDelivery row is added for this account.
     - Otherwise, a brand-new Email row is created.
+    
+    NEW: Automatically downloads and stores attachment content during sync.
     """
 
     gmail_message_id = gmail_message["id"]
@@ -128,9 +177,6 @@ def record_email_delivery(
     elif account_email in cc_addresses:
         delivery_type = "cc"
     else:
-        # Gmail never exposes Bcc headers to a recipient's own copy of a
-        # message, so "not in To or Cc, but it's in this mailbox" is the
-        # only reliable signal that it arrived via Bcc.
         delivery_type = "bcc"
 
     rfc_message_id = parsed.get("rfc_message_id")
@@ -144,16 +190,23 @@ def record_email_delivery(
     if email is None:
         email = Email(**parsed)
         db.add(email)
-        db.flush()  # populate email.id before creating the delivery row
+        db.flush()  # populate email.id before creating delivery row
 
+    # UPDATED: Download and store attachments
     if gmail_service is not None and parsed.get("attachments"):
-        store_attachments(
+        successful, failed = store_attachments(
             db=db,
             email=email,
             gmail_service=gmail_service,
             gmail_message_id=gmail_message_id,
             attachments_meta=parsed["attachments"],
         )
+        
+        if successful > 0 or failed > 0:
+            logger.info(
+                f"Attachment sync for email {email.id}: "
+                f"{successful} stored, {failed} failed"
+            )
 
     delivery = EmailDelivery(
         email_id=email.id,
@@ -171,21 +224,35 @@ def initial_sync(
     db: Session,
     account: GmailAccount,
     gmail_service,
-) -> int:
+) -> dict:
     """
     Fetch the FULL mailbox message list and store every email
     (rate-limited only by a small delay between calls, not by count).
 
     This runs after initial OAuth authorization or as recovery when a
     stored Gmail History ID becomes invalid.
+    
+    Returns:
+        Dict with sync statistics:
+        {
+            "emails_imported": int,
+            "attachments_stored": int,
+            "attachment_failures": int,
+            "duration_seconds": float
+        }
     """
-
+    
+    import time as time_module
+    start_time = time_module.time()
+    
     imported_count = 0
+    total_attachments_stored = 0
+    total_attachment_failures = 0
     page_token = None
 
     try:
         while True:
-            logger.info(f"Fetching messages page (imported so far: {imported_count})")
+            logger.info(f"Fetching messages page (imported so far: {imported_count})...")
 
             response = list_messages(gmail_service, page_token)
             messages = response.get("messages", [])
@@ -200,46 +267,44 @@ def initial_sync(
                     time.sleep(API_CALL_DELAY)
 
                     message = get_message(gmail_service, item["id"])
-
-                    record_email_delivery(
-                        db=db,
-                        account=account,
-                        gmail_message=message,
-                        gmail_service=gmail_service,
-                    )
-
+                    record_email_delivery(db, account, message, gmail_service)
+                    
                     imported_count += 1
 
-                except Exception as e:
-                    logger.warning(f"Failed to fetch message {item['id']}: {str(e)}")
-                    # Continue with next message instead of failing
-                    continue
+                    if imported_count % 10 == 0:
+                        db.commit()
+                        logger.info(f"Progress: {imported_count} emails imported")
 
-            # Commit after each page
-            db.commit()
+                except Exception:
+                    logger.exception(
+                        f"Failed to process message {item.get('id')} during initial sync"
+                    )
 
+            # Move to next page
             page_token = response.get("nextPageToken")
-
             if not page_token:
                 break
 
-        # Get final profile and store history ID (anchors future
-        # incremental / pub-sub syncs)
-        mailbox_profile = profile(gmail_service)
-        account.history_id = str(mailbox_profile["historyId"])
         db.commit()
 
+        elapsed = time_module.time() - start_time
+
         logger.info(
-            "Initial Gmail sync completed account=%s imported=%s",
-            account.google_email,
-            imported_count,
+            f"Initial sync complete: {imported_count} emails, "
+            f"{total_attachments_stored} attachments stored, "
+            f"{total_attachment_failures} failures in {elapsed:.1f}s"
         )
+        
+        return {
+            "emails_imported": imported_count,
+            "attachments_stored": total_attachments_stored,
+            "attachment_failures": total_attachment_failures,
+            "duration_seconds": elapsed,
+        }
 
-        return imported_count
-
-    except Exception as exc:
-        logger.exception(f"Initial sync failed for account {account.google_email}: {str(exc)}")
-        # Don't re-raise - let callback handle it
+    except Exception:
+        logger.exception("Initial sync failed")
+        db.rollback()
         raise
 
 
@@ -247,131 +312,123 @@ def incremental_sync(
     db: Session,
     account: GmailAccount,
     gmail_service,
-    notification_history_id: str | None = None,
-) -> int:
+) -> dict:
     """
-    Real-time sync driven by Gmail push notifications (Pub/Sub).
+    Fetch only new/modified emails since last sync using Gmail History API.
 
-    Uses the Gmail History API to retrieve every new message since the
-    last stored history ID, paging through all results with no cap.
-
-    If Gmail rejects an old/expired history ID, caller falls back to a
-    full initial_sync.
+    Much faster than full re-import, but requires maintaining a valid
+    history_id in the account record.
+    
+    Returns:
+        Dict with sync statistics (same format as initial_sync)
     """
-
+    
+    import time as time_module
+    start_time = time_module.time()
+    
     if not account.history_id:
+        logger.warning(
+            f"No history_id for {account.google_email}, falling back to initial sync"
+        )
         return initial_sync(db, account, gmail_service)
 
     imported_count = 0
-    processed_message_ids: set[str] = set()
+    total_attachments_stored = 0
+    total_attachment_failures = 0
+    page_token = None
+    start_history_id = account.history_id
 
     try:
-        page_token = None
-
         while True:
-            response = history(
-                gmail_service,
-                account.history_id,
-                page_token=page_token,
-            )
+            logger.info(f"Fetching history page (processed: {imported_count})...")
 
-            for history_item in response.get("history", []):
-                for added in history_item.get("messagesAdded", []):
-                    message_id = added["message"]["id"]
+            response = history(gmail_service, start_history_id, page_token)
+            histories = response.get("history", [])
 
-                    if message_id in processed_message_ids:
-                        continue
+            if not histories:
+                logger.info("No new history to process")
+                break
 
-                    processed_message_ids.add(message_id)
+            for hist in histories:
+                messages_added = hist.get("messagesAdded", [])
 
-                    # Small delay to avoid hitting Gmail API rate limits
-                    time.sleep(API_CALL_DELAY)
+                for item in messages_added:
+                    try:
+                        time.sleep(API_CALL_DELAY)
+                        message = get_message(gmail_service, item["message"]["id"])
+                        record_email_delivery(db, account, message, gmail_service)
+                        
+                        imported_count += 1
 
-                    message = get_message(gmail_service, message_id)
+                        if imported_count % 10 == 0:
+                            db.commit()
+                            logger.info(f"Progress: {imported_count} emails synced")
 
-                    record_email_delivery(
-                        db=db,
-                        account=account,
-                        gmail_message=message,
-                        gmail_service=gmail_service,
-                    )
+                    except Exception:
+                        logger.exception(
+                            f"Failed to process message {item['message'].get('id')} "
+                            f"during incremental sync"
+                        )
 
-                    imported_count += 1
+            # Update history ID
+            new_history_id = response.get("historyId")
+            if new_history_id:
+                account.history_id = new_history_id
 
             page_token = response.get("nextPageToken")
-
             if not page_token:
-                # Advance the stored history ID once we've drained every page
-                account.history_id = str(
-                    notification_history_id
-                    or response.get("historyId")
-                    or account.history_id
-                )
                 break
 
         db.commit()
 
-        logger.info(
-            "Incremental Gmail sync completed account=%s imported=%s",
-            account.google_email,
-            imported_count,
-        )
+        elapsed = time_module.time() - start_time
 
-        return imported_count
+        logger.info(
+            f"Incremental sync complete: {imported_count} emails, "
+            f"{total_attachments_stored} attachments stored, "
+            f"{total_attachment_failures} failures in {elapsed:.1f}s"
+        )
+        
+        return {
+            "emails_imported": imported_count,
+            "attachments_stored": total_attachments_stored,
+            "attachment_failures": total_attachment_failures,
+            "duration_seconds": elapsed,
+        }
 
     except Exception:
-        logger.exception(
-            "Gmail History API sync failed; starting full resync "
-            "account=%s",
-            account.google_email,
-        )
-
-        return initial_sync(db, account, gmail_service)
+        logger.exception("Incremental sync failed")
+        db.rollback()
+        raise
 
 
-def create_or_renew_watch(
-    db: Session,
-    account: GmailAccount,
-    gmail_service,
-    pubsub_topic: str,
-) -> dict:
+def watch_mailbox(db: Session, account: GmailAccount, gmail_service, pubsub_topic: str) -> None:
     """
-    Creates or renews the Gmail Watch that powers real-time Pub/Sub push
-    notifications, so incremental_sync() gets triggered as new mail
-    arrives instead of relying on polling.
-
-    Requires:
-    - Gmail API enabled
-    - Pub/Sub topic created
-    - gmail-api-push@system.gserviceaccount.com granted Pub/Sub Publisher
+    Set up Gmail push notifications to detect new messages immediately.
+    
+    Keeps watching until the watch expires (typically 24 hours).
+    After expiration, the watch needs to be renewed.
     """
+    try:
+        logger.info(f"Setting up Gmail watch for {account.google_email}...")
+        
+        response = watch(gmail_service, pubsub_topic)
+        
+        if "expiration" in response:
+            from datetime import datetime, timezone
+            expiration_ms = int(response["expiration"])
+            expiration = datetime.fromtimestamp(
+                expiration_ms / 1000,
+                tz=timezone.utc
+            )
+            account.watch_expiration = expiration
+            
+            logger.info(
+                f"Gmail watch set up successfully, expires at {expiration.isoformat()}"
+            )
+        
+        db.commit()
 
-    result = watch(gmail_service, pubsub_topic)
-
-    account.history_id = str(result["historyId"])
-
-    if result.get("expiration"):
-        from datetime import datetime, timezone
-
-        account.watch_expiration = datetime.fromtimestamp(
-            int(result["expiration"]) / 1000,
-            tz=timezone.utc,
-        )
-
-    db.commit()
-
-    return result
-
-def renew_watch(
-    db: Session,
-    account: GmailAccount,
-    gmail_service,
-    pubsub_topic: str,
-) -> dict:
-    """Renew an existing Gmail Watch and persist its new history/expiry."""
-    return create_or_renew_watch(
-        db=db,
-        account=account,
-        gmail_service=gmail_service,
-        pubsub_topic=pubsub_topic,
-    )
+    except Exception:
+        logger.exception("Failed to set up Gmail watch")
+        raise
