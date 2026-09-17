@@ -10,7 +10,7 @@ Key improvements:
 
 import logging
 import time
-
+from typing import Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
