@@ -41,7 +41,7 @@ def store_attachments(
     gmail_service,
     gmail_message_id: str,
     attachments_meta: list[dict],
-) -> tuple[int, int]:
+) -> Tuple[int, int]:
     """
     Downloads and stores the actual bytes for any attachment listed in
     Email.attachments (parsed metadata) that isn't already saved in the
@@ -60,7 +60,7 @@ def store_attachments(
         attachments_meta: List of attachment metadata dicts
         
     Returns:
-        tuple of (successful_downloads, failed_downloads)
+        Tuple of (successful_downloads, failed_downloads)
     """
     
     successful = 0
