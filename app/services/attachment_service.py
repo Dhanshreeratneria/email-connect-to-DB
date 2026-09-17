@@ -12,7 +12,7 @@ import base64
 import logging
 import time
 from io import BytesIO
-from typing import Optional, tuple
+from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -106,7 +106,7 @@ def download_and_store_attachment(
 def get_attachment_content_base64(
     db: Session,
     attachment_id: int,
-) -> Optional[tuple[str, str, str]]:
+) -> Optional[Tuple[str, str, str]]:
     """
     Retrieves attachment content as base64 for display in Claude.
     
@@ -115,7 +115,7 @@ def get_attachment_content_base64(
         attachment_id: Internal attachment ID
         
     Returns:
-        tuple of (base64_content, mime_type, filename) or None if not found
+        Tuple of (base64_content, mime_type, filename) or None if not found
     """
     
     attachment = db.scalar(
@@ -306,7 +306,7 @@ def extract_text_from_attachment(
 def get_image_dimensions(
     db: Session,
     attachment_id: int,
-) -> Optional[tuple[int, int]]:
+) -> Optional[Tuple[int, int]]:
     """
     Gets image dimensions (width, height) for display purposes.
     
@@ -317,7 +317,7 @@ def get_image_dimensions(
         attachment_id: Internal attachment ID
         
     Returns:
-        tuple of (width, height) or None if not an image or failed
+        Tuple of (width, height) or None if not an image or failed
     """
     
     attachment = db.scalar(
