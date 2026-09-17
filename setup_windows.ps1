@@ -269,7 +269,7 @@ if (-not $SkipPip) {
     
     $packagesToCheck = @(
         "sqlalchemy",
-        "psycopg",
+        "psycopg2",
         "fastapi",
         "google-auth",
         "PIL",
