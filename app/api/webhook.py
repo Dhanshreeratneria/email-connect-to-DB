@@ -2,7 +2,7 @@ import base64
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -18,9 +18,40 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhooks/google", tags=["webhook"])
 
 
+def _run_incremental_sync(
+    db: Session,
+    account: GmailAccount,
+    gmail_service,
+    notification_history_id: str,
+    google_email: str,
+) -> None:
+    """
+    Runs the (blocking) sync off the request/response cycle.
+    FastAPI executes sync background tasks in a worker thread, so this
+    no longer freezes the single event loop (and the /mcp endpoint)
+    while a full resync grinds through the mailbox.
+    """
+    try:
+        imported_count = incremental_sync(
+            db=db,
+            account=account,
+            gmail_service=gmail_service,
+            notification_history_id=notification_history_id,
+        )
+        logger.info(
+            "Pub/Sub Gmail sync completed email=%s imported=%s history_id=%s",
+            google_email,
+            imported_count,
+            account.history_id,
+        )
+    except Exception:
+        logger.exception("Background Gmail sync failed for %s", google_email)
+
+
 @router.post("/pubsub")
 async def gmail_pubsub_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     """
@@ -92,28 +123,22 @@ async def gmail_pubsub_webhook(
         credentials = decrypt_credentials(account.encrypted_token)
         gmail_service = gmail(credentials)
 
-        imported_count = incremental_sync(
-            db=db,
-            account=account,
-            gmail_service=gmail_service,
-            notification_history_id=str(notification_history_id),
-        )
-
-        logger.info(
-            "Pub/Sub Gmail sync completed email=%s imported=%s history_id=%s",
+        # Schedule the sync to run AFTER this response is sent, in a
+        # worker thread, instead of blocking this (only) event loop.
+        # This is also what Pub/Sub push expects: ack quickly, or it
+        # will keep re-delivering the notification.
+        background_tasks.add_task(
+            _run_incremental_sync,
+            db,
+            account,
+            gmail_service,
+            str(notification_history_id),
             google_email,
-            imported_count,
-            account.history_id,
         )
 
-        # Acknowledge the Pub/Sub push only after the sync function has
-        # completed successfully. If sync raises, the except block returns
-        # 500 and Pub/Sub can retry the notification.
         return {
-            "status": "ok",
+            "status": "accepted",
             "google_email": google_email,
-            "imported": imported_count,
-            "history_id": account.history_id,
         }
 
     except Exception as exc:
