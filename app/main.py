@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
+from app.api.attachments import router as attachments_router
 from app.config import settings
 from app.database import get_db
 from app.mcp.server import mcp
@@ -51,6 +52,9 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
+# BUG FIX: this router (metadata/base64/text/image-info/attachments summary
+# endpoints) was defined but never mounted, so every route in it 404'd.
+app.include_router(attachments_router)
 
 # Configure MCP server
 logger.info("Configuring MCP server")
@@ -169,10 +173,19 @@ def mcp_info():
                 "search_emails",
                 "get_email",
                 "list_emails",
+                "list_emails_by_category",
                 "get_thread",
                 "search_by_sender",
                 "search_by_subject",
                 "search_by_date",
+                # BUG FIX: this list had gone stale — the attachment tools
+                # below already existed in app/mcp/server.py but were never
+                # listed here, so callers of /mcp/info couldn't discover them.
+                "list_attachments",
+                "get_attachment_content",
+                "extract_attachment_text",
+                "get_email_with_attachments",
+                "search_emails_with_attachments",
             ]
         },
     }

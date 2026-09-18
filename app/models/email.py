@@ -1,132 +1,66 @@
 from datetime import datetime
 
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    Integer,
-    JSON,
-    LargeBinary,
-    String,
-    Text,
-    UniqueConstraint,
-    func,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pydantic import BaseModel, model_validator
 
-from app.database import Base
+from app.config import settings
+from app.services.attachment_service import is_displayable_in_claude
 
 
-class GmailAccount(Base):
-    __tablename__ = "gmail_accounts"
+class EmailOut(BaseModel):
+    id: int
+    rfc_message_id: str | None
+    thread_id: str
+    sender_name: str | None
+    sender_email: str
+    recipients: list
+    subject: str | None
+    body_text: str | None
+    received_at: datetime
+    labels: list
+    category: str | None
+    has_attachments: bool
+    attachments: list
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    google_email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
-    encrypted_token: Mapped[str] = mapped_column(Text)
-    history_id: Mapped[str | None] = mapped_column(String(64))
-    watch_expiration: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    deliveries: Mapped[list["EmailDelivery"]] = relationship(back_populates="account")
+    class Config:
+        from_attributes = True
 
 
-class Email(Base):
+class AttachmentOut(BaseModel):
     """
-    One row per unique real-world email (keyed by its RFC Message-ID
-    header), regardless of how many connected inboxes received it.
-    Which account(s) received it, and how (To/Cc/Bcc), lives in
-    EmailDelivery.
+    Attachment metadata only — never the binary `content` column, so
+    listing an email's attachments stays small even when the file
+    itself (PDF/zip/image/etc.) is large. Fetch the actual bytes via
+    the separate /attachments/{attachment_id}/download endpoint.
     """
 
-    __tablename__ = "emails"
+    id: int
+    gmail_attachment_id: str
+    filename: str
+    mime_type: str | None
+    size: int | None
+    # BUG FIX: these two were missing, so every attachment listed via
+    # GET /emails/{message_id}/attachments came back with no way to know
+    # whether Claude/VS Code could preview it or where to download it from
+    # — callers had to hand-build the URL themselves from `id`.
+    is_displayable: bool = False
+    download_url: str = ""
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    rfc_message_id: Mapped[str | None] = mapped_column(String(998), index=True)
-    thread_id: Mapped[str] = mapped_column(String(255), index=True)
-    sender_name: Mapped[str | None] = mapped_column(String(500))
-    sender_email: Mapped[str] = mapped_column(String(320), index=True)
-    recipients: Mapped[list] = mapped_column(JSON)
-    subject: Mapped[str | None] = mapped_column(Text)
-    body_text: Mapped[str | None] = mapped_column(Text)
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    labels: Mapped[list] = mapped_column(JSON)
-    category: Mapped[str | None] = mapped_column(String(32), index=True)
-    has_attachments: Mapped[bool] = mapped_column(Boolean, default=False)
-    attachments: Mapped[list] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
+    class Config:
+        from_attributes = True
 
-    deliveries: Mapped[list["EmailDelivery"]] = relationship(
-        back_populates="email", cascade="all, delete-orphan"
-    )
-    stored_attachments: Mapped[list["EmailAttachment"]] = relationship(
-        back_populates="email", cascade="all, delete-orphan"
-    )
+    @model_validator(mode="after")
+    def _add_computed_fields(self) -> "AttachmentOut":
+        self.is_displayable = is_displayable_in_claude(self.mime_type)
+        base = settings.public_base_url.rstrip("/")
+        self.download_url = f"{base}/attachments/{self.id}/download"
+        return self
 
 
-class EmailDelivery(Base):
-    """
-    Tracks which connected inbox(es) received a given email, and how
-    (To / Cc / Bcc). Prevents storing the same email content twice when
-    it lands in more than one of your connected Gmail accounts.
-    """
+class EmailDeliveryOut(BaseModel):
+    account_id: int
+    gmail_message_id: str
+    delivery_type: str
+    received_at: datetime
 
-    __tablename__ = "email_deliveries"
-    __table_args__ = (
-        UniqueConstraint("account_id", "gmail_message_id", name="uq_account_gmail_message"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email_id: Mapped[int] = mapped_column(
-        ForeignKey("emails.id", ondelete="CASCADE"), index=True
-    )
-    account_id: Mapped[int] = mapped_column(
-        ForeignKey("gmail_accounts.id", ondelete="CASCADE"), index=True
-    )
-    gmail_message_id: Mapped[str] = mapped_column(String(255))
-    delivery_type: Mapped[str] = mapped_column(String(16), default="to")  # "to" | "cc" | "bcc"
-    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    email: Mapped["Email"] = relationship(back_populates="deliveries")
-    account: Mapped["GmailAccount"] = relationship(back_populates="deliveries")
-
-
-class EmailAttachment(Base):
-    """
-    Actual binary content of one email attachment (PDF, image, zip, docx,
-    etc.), stored directly in Postgres as BYTEA via LargeBinary.
-
-    `Email.attachments` (JSON) keeps lightweight, always-present metadata
-    (filename/mime_type/size/gmail attachment id) parsed straight off the
-    Gmail payload. This table is populated afterwards, once per unique
-    attachment, by actually downloading the bytes from the Gmail API
-    (messages().attachments().get) — Gmail never inlines attachment bytes
-    in the message payload itself, only a reference to fetch them by id.
-    """
-
-    __tablename__ = "email_attachments"
-    __table_args__ = (
-        UniqueConstraint(
-            "email_id", "gmail_attachment_id", name="uq_email_gmail_attachment"
-        ),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    email_id: Mapped[int] = mapped_column(
-        ForeignKey("emails.id", ondelete="CASCADE"), index=True
-    )
-    gmail_attachment_id: Mapped[str] = mapped_column(String(512))
-    filename: Mapped[str] = mapped_column(String(1024))
-    mime_type: Mapped[str | None] = mapped_column(String(255))
-    size: Mapped[int | None] = mapped_column(BigInteger)
-    content: Mapped[bytes | None] = mapped_column(LargeBinary)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-    email: Mapped["Email"] = relationship(back_populates="stored_attachments")
+    class Config:
+        from_attributes = True

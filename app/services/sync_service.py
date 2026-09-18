@@ -135,7 +135,7 @@ def record_email_delivery(
     account: GmailAccount,
     gmail_message: dict,
     gmail_service=None,
-) -> Email:
+) -> Tuple[Email, int, int]:
     """
     Store (or link to) an email exactly once by its RFC Message-ID header,
     and record how THIS account received it (to / cc / bcc).
@@ -149,6 +149,15 @@ def record_email_delivery(
     - Otherwise, a brand-new Email row is created.
     
     NEW: Automatically downloads and stores attachment content during sync.
+
+    Returns:
+        Tuple of (email, attachments_stored, attachments_failed).
+        # BUG FIX: this used to return only `email`. store_attachments()
+        # below already computed per-message (successful, failed) counts,
+        # but they were silently discarded, so initial_sync()/
+        # incremental_sync() could never accumulate real totals and always
+        # reported "0 attachments stored / 0 failed" in their stats even
+        # when attachments were downloaded successfully.
     """
 
     gmail_message_id = gmail_message["id"]
@@ -162,7 +171,7 @@ def record_email_delivery(
     )
 
     if existing_delivery:
-        return existing_delivery.email
+        return existing_delivery.email, 0, 0
 
     parsed = parse_message(gmail_message)
 
@@ -193,8 +202,10 @@ def record_email_delivery(
         db.flush()  # populate email.id before creating delivery row
 
     # UPDATED: Download and store attachments
+    attachments_stored = 0
+    attachments_failed = 0
     if gmail_service is not None and parsed.get("attachments"):
-        successful, failed = store_attachments(
+        attachments_stored, attachments_failed = store_attachments(
             db=db,
             email=email,
             gmail_service=gmail_service,
@@ -202,10 +213,10 @@ def record_email_delivery(
             attachments_meta=parsed["attachments"],
         )
         
-        if successful > 0 or failed > 0:
+        if attachments_stored > 0 or attachments_failed > 0:
             logger.info(
                 f"Attachment sync for email {email.id}: "
-                f"{successful} stored, {failed} failed"
+                f"{attachments_stored} stored, {attachments_failed} failed"
             )
 
     delivery = EmailDelivery(
@@ -217,7 +228,7 @@ def record_email_delivery(
     )
     db.add(delivery)
 
-    return email
+    return email, attachments_stored, attachments_failed
 
 
 def initial_sync(
@@ -267,8 +278,12 @@ def initial_sync(
                     time.sleep(API_CALL_DELAY)
 
                     message = get_message(gmail_service, item["id"])
-                    record_email_delivery(db, account, message, gmail_service)
-                    
+                    _, stored, failed = record_email_delivery(
+                        db, account, message, gmail_service
+                    )
+                    total_attachments_stored += stored
+                    total_attachment_failures += failed
+
                     imported_count += 1
 
                     if imported_count % 10 == 0:
@@ -356,7 +371,11 @@ def incremental_sync(
                     try:
                         time.sleep(API_CALL_DELAY)
                         message = get_message(gmail_service, item["message"]["id"])
-                        record_email_delivery(db, account, message, gmail_service)
+                        _, stored, failed = record_email_delivery(
+                            db, account, message, gmail_service
+                        )
+                        total_attachments_stored += stored
+                        total_attachment_failures += failed
                         
                         imported_count += 1
 
