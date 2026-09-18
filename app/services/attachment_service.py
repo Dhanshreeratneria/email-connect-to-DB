@@ -1,44 +1,30 @@
-"""Attachment download, storage, classification, extraction and rendering."""
+"""
+Service module for downloading and processing email attachments from Gmail.
 
-from __future__ import annotations
+Handles:
+- Downloading attachment bytes from Gmail API
+- Storing binary content in PostgreSQL
+- Converting attachments to displayable formats (base64, text extraction, etc.)
+- Error handling and logging
+"""
 
 import base64
 import logging
-import mimetypes
 import time
 from io import BytesIO
 from typing import Optional, Tuple
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
-from app.models.email import EmailAttachment
-from app.services.email_parser import decode_base64_urlsafe_bytes
+from app.models.email import Email, EmailAttachment
 from app.services.gmail_service import get_attachment
+from app.services.email_parser import decode_base64_urlsafe_bytes
 
 logger = logging.getLogger(__name__)
+
+# Delay between API calls to avoid rate limiting
 API_CALL_DELAY = 0.1
-
-
-def attachment_category(mime_type: Optional[str], filename: Optional[str] = None) -> str:
-    mime = (mime_type or "").lower()
-    name = (filename or "").lower()
-
-    if mime.startswith("image/"):
-        return "image"
-    if mime == "application/pdf" or name.endswith(".pdf"):
-        return "pdf"
-    if "word" in mime or "wordprocessingml" in mime or name.endswith((".doc", ".docx")):
-        return "document"
-    if "excel" in mime or "spreadsheet" in mime or mime == "text/csv" or name.endswith((".xls", ".xlsx", ".csv")):
-        return "spreadsheet"
-    if "presentation" in mime or "powerpoint" in mime or name.endswith((".ppt", ".pptx")):
-        return "presentation"
-    if mime.startswith("text/") or "json" in mime or name.endswith((".txt", ".json", ".xml", ".rtf")):
-        return "text"
-    if any(x in mime for x in ("zip", "rar", "7z", "tar", "gzip")) or name.endswith((".zip", ".rar", ".7z", ".tar", ".gz")):
-        return "archive"
-    return "other"
 
 
 def download_and_store_attachment(
@@ -51,51 +37,69 @@ def download_and_store_attachment(
     size: Optional[int],
     gmail_service,
 ) -> Optional[EmailAttachment]:
-    """Download Gmail attachment bytes and store them in PostgreSQL."""
+    """
+    Downloads attachment bytes from Gmail API and stores them in PostgreSQL.
+    
+    Args:
+        db: SQLAlchemy session
+        email_id: Internal email ID
+        gmail_message_id: Gmail message ID
+        gmail_attachment_id: Gmail attachment ID
+        filename: Original filename
+        mime_type: MIME type (e.g., 'application/pdf')
+        size: File size in bytes
+        gmail_service: Gmail API service instance
+        
+    Returns:
+        EmailAttachment object if successful, None if failed
+    """
+    
+    # Check if already stored
     existing = db.scalar(
         select(EmailAttachment).where(
             EmailAttachment.email_id == email_id,
             EmailAttachment.gmail_attachment_id == gmail_attachment_id,
         )
     )
+    
     if existing:
+        logger.debug(f"Attachment {gmail_attachment_id} already stored")
         return existing
-
+    
     try:
+        # Rate limiting
         time.sleep(API_CALL_DELAY)
+        
+        # Download from Gmail
         raw = get_attachment(gmail_service, gmail_message_id, gmail_attachment_id)
         content = decode_base64_urlsafe_bytes(raw.get("data", ""))
-
-        if not content:
-            logger.warning(
-                "Gmail returned no content for attachment %s",
-                gmail_attachment_id,
-            )
-            return None
-
+        
+        # Store in database
         attachment = EmailAttachment(
             email_id=email_id,
             gmail_attachment_id=gmail_attachment_id,
             filename=filename or "attachment",
-            mime_type=mime_type or mimetypes.guess_type(filename or "")[0],
+            mime_type=mime_type,
             size=size or len(content),
             content=content,
         )
+        
         db.add(attachment)
-        db.flush()
+        # The caller owns the transaction. Do not commit here.
+        
         logger.info(
-            "Stored attachment filename=%s email_id=%s bytes=%s",
-            filename,
-            email_id,
-            len(content),
+            f"Stored attachment {filename} ({len(content)} bytes) "
+            f"for email {email_id}"
         )
+        
         return attachment
-    except Exception:
-        logger.exception(
-            "Failed to download attachment %s for Gmail message %s",
-            gmail_attachment_id,
-            gmail_message_id,
+        
+    except Exception as e:
+        logger.error(
+            f"Failed to download attachment {gmail_attachment_id} "
+            f"for message {gmail_message_id}: {str(e)}"
         )
+        # Do not rollback the caller's transaction here.
         return None
 
 
@@ -103,145 +107,237 @@ def get_attachment_content_base64(
     db: Session,
     attachment_id: int,
 ) -> Optional[Tuple[str, str, str]]:
-    attachment = db.get(EmailAttachment, attachment_id)
+    """
+    Retrieves attachment content as base64 for display in Claude.
+    
+    Args:
+        db: SQLAlchemy session
+        attachment_id: Internal attachment ID
+        
+    Returns:
+        Tuple of (base64_content, mime_type, filename) or None if not found
+    """
+    
+    attachment = db.scalar(
+        select(EmailAttachment).where(EmailAttachment.id == attachment_id)
+    )
+    
     if not attachment or not attachment.content:
+        logger.warning(f"Attachment {attachment_id} not found or has no content")
         return None
+    
+    base64_content = base64.b64encode(attachment.content).decode("utf-8")
+    
     return (
-        base64.b64encode(attachment.content).decode("ascii"),
+        base64_content,
         attachment.mime_type or "application/octet-stream",
         attachment.filename,
     )
 
 
+def get_email_attachments_with_content(
+    db: Session,
+    email_id: int,
+) -> list[dict]:
+    """
+    Retrieves all attachments for an email with their content as base64.
+    
+    Useful for displaying in Claude or other tools.
+    
+    Args:
+        db: SQLAlchemy session
+        email_id: Internal email ID
+        
+    Returns:
+        List of attachment dicts with: id, filename, mime_type, size, 
+        content_base64, is_displayable
+    """
+    
+    attachments = db.scalars(
+        select(EmailAttachment).where(EmailAttachment.email_id == email_id)
+    ).all()
+    
+    result = []
+    
+    for att in attachments:
+        att_dict = {
+            "id": att.id,
+            "filename": att.filename,
+            "mime_type": att.mime_type,
+            "size": att.size,
+            "gmail_attachment_id": att.gmail_attachment_id,
+        }
+        
+        # Add base64 content if available
+        if att.content:
+            att_dict["content_base64"] = base64.b64encode(att.content).decode("utf-8")
+            att_dict["is_displayable"] = is_displayable_in_claude(att.mime_type)
+        else:
+            att_dict["content_base64"] = None
+            att_dict["is_displayable"] = False
+        
+        result.append(att_dict)
+    
+    return result
+
+
 def is_displayable_in_claude(mime_type: Optional[str]) -> bool:
-    """Whether the type can be represented directly by this MCP server."""
-    return bool(mime_type and (
-        mime_type.lower().startswith("image/")
-        or mime_type.lower() == "application/pdf"
-    ))
+    """
+    Determines if attachment type can be displayed directly in Claude.
+    
+    Displayable types:
+    - Images: image/jpeg, image/png, image/gif, image/webp
+    - PDFs: application/pdf
+    - Text: text/plain, text/csv, text/xml, application/json
+    
+    Args:
+        mime_type: MIME type string
+        
+    Returns:
+        True if displayable, False otherwise
+    """
+    
+    if not mime_type:
+        return False
+    
+    displayable_types = {
+        "image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml",
+        "application/pdf",
+        "text/plain", "text/csv", "text/xml", "application/json",
+    }
+    
+    return mime_type.lower() in displayable_types
 
 
 def extract_text_from_attachment(
-    attachment: EmailAttachment,
+    db: Session,
+    attachment_id: int,
 ) -> Optional[str]:
-    """Extract readable text from common office/document formats."""
-    if not attachment.content:
+    """
+    Attempts to extract plain text from various document types.
+    
+    Supported formats:
+    - PDF (via PyMuPDF/fitz)
+    - DOCX (via python-docx)
+    - XLSX (via openpyxl)
+    - PPTX (via python-pptx)
+    - Plain text files
+    - RTF (via striprtf)
+    
+    Args:
+        db: SQLAlchemy session
+        attachment_id: Internal attachment ID
+        
+    Returns:
+        Extracted text string, or None if extraction failed
+    """
+    
+    attachment = db.scalar(
+        select(EmailAttachment).where(EmailAttachment.id == attachment_id)
+    )
+    
+    if not attachment or not attachment.content:
         return None
-
-    mime = (attachment.mime_type or "").lower()
-    name = (attachment.filename or "").lower()
-    data = attachment.content
-
+    
+    mime_type = (attachment.mime_type or "").lower()
+    
     try:
-        if mime == "application/pdf" or name.endswith(".pdf"):
-            import fitz
-            doc = fitz.open(stream=data, filetype="pdf")
-            try:
-                text = "\n".join(page.get_text() for page in doc)
-            finally:
-                doc.close()
-            return text.strip() or None
-
-        if "wordprocessingml" in mime or name.endswith(".docx"):
+        # PDF extraction
+        if "pdf" in mime_type:
+            import fitz  # PyMuPDF
+            
+            doc = fitz.open(stream=attachment.content, filetype="pdf")
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            return text.strip() if text.strip() else None
+        
+        # DOCX extraction
+        elif "wordprocessingml" in mime_type or mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             from docx import Document
-            doc = Document(BytesIO(data))
-            parts = [p.text for p in doc.paragraphs if p.text]
-            for table in doc.tables:
-                for row in table.rows:
-                    parts.append("\t".join(cell.text for cell in row.cells))
-            return "\n".join(parts).strip() or None
-
-        if "spreadsheetml" in mime or mime == "application/vnd.ms-excel" or mime == "text/csv" or name.endswith((".xlsx", ".csv")):
-            if mime == "text/csv" or name.endswith(".csv"):
-                return data.decode("utf-8-sig", errors="replace").strip() or None
+            
+            doc = Document(BytesIO(attachment.content))
+            text = "\n".join(para.text for para in doc.paragraphs)
+            return text.strip() if text.strip() else None
+        
+        # XLSX extraction
+        elif "spreadsheetml" in mime_type or mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
             from openpyxl import load_workbook
-            wb = load_workbook(BytesIO(data), read_only=True, data_only=True)
-            try:
-                lines = []
-                for sheet in wb.sheetnames:
-                    ws = wb[sheet]
-                    lines.append(f"Sheet: {sheet}")
-                    for row in ws.iter_rows(values_only=True):
-                        values = [str(v) for v in row if v is not None]
-                        if values:
-                            lines.append("\t".join(values))
-                return "\n".join(lines).strip() or None
-            finally:
-                wb.close()
-
-        if "presentationml" in mime or name.endswith(".pptx"):
+            
+            wb = load_workbook(BytesIO(attachment.content))
+            text_lines = []
+            for sheet in wb.sheetnames:
+                ws = wb[sheet]
+                text_lines.append(f"Sheet: {sheet}")
+                for row in ws.iter_rows(values_only=True):
+                    text_lines.append("\t".join(str(v) for v in row if v is not None))
+            return "\n".join(text_lines).strip()
+        
+        # PPTX extraction
+        elif "presentationml" in mime_type:
             from pptx import Presentation
-            prs = Presentation(BytesIO(data))
-            lines = []
-            for i, slide in enumerate(prs.slides, 1):
-                lines.append(f"Slide {i}:")
+            
+            prs = Presentation(BytesIO(attachment.content))
+            text_lines = []
+            for slide_num, slide in enumerate(prs.slides, 1):
+                text_lines.append(f"Slide {slide_num}:")
                 for shape in slide.shapes:
-                    if hasattr(shape, "text") and shape.text:
-                        lines.append(shape.text)
-            return "\n".join(lines).strip() or None
-
-        if mime.startswith("text/") or mime == "application/json" or name.endswith((".txt", ".json", ".xml", ".csv")):
-            return data.decode("utf-8-sig", errors="replace").strip() or None
-
-        if "rtf" in mime or name.endswith(".rtf"):
+                    if hasattr(shape, "text"):
+                        text_lines.append(shape.text)
+            return "\n".join(text_lines).strip()
+        
+        # Plain text
+        elif "text/plain" in mime_type:
+            return attachment.content.decode("utf-8", errors="replace").strip()
+        
+        # RTF extraction
+        elif "rtf" in mime_type:
             from striprtf.striprtf import rtf_to_text
-            text = rtf_to_text(data.decode("utf-8", errors="replace"))
-            return text.strip() or None
-
-    except Exception:
-        logger.exception(
-            "Text extraction failed for attachment id=%s filename=%s",
-            attachment.id,
-            attachment.filename,
-        )
-
+            
+            text = rtf_to_text(attachment.content.decode("utf-8", errors="replace"))
+            return text.strip() if text.strip() else None
+        
+    except Exception as e:
+        logger.error(f"Failed to extract text from attachment {attachment_id}: {str(e)}")
+        return None
+    
     return None
-
-
-def render_pdf_pages(
-    content: bytes,
-    max_pages: int = 5,
-    scale: float = 1.5,
-) -> list[tuple[int, bytes]]:
-    """
-    Render PDF pages as PNGs for MCP ImageContent.
-    Only a bounded number of pages are rendered to prevent oversized responses.
-    """
-    import fitz
-
-    pages: list[tuple[int, bytes]] = []
-    doc = fitz.open(stream=content, filetype="pdf")
-    try:
-        count = min(len(doc), max(1, max_pages))
-        matrix = fitz.Matrix(scale, scale)
-        for index in range(count):
-            pix = doc[index].get_pixmap(
-                matrix=matrix,
-                alpha=False,
-            )
-            pages.append((index + 1, pix.tobytes("png")))
-    finally:
-        doc.close()
-    return pages
 
 
 def get_image_dimensions(
     db: Session,
     attachment_id: int,
 ) -> Optional[Tuple[int, int]]:
-    attachment = db.get(EmailAttachment, attachment_id)
+    """
+    Gets image dimensions (width, height) for display purposes.
+    
+    Works with: JPEG, PNG, GIF, WebP, SVG
+    
+    Args:
+        db: SQLAlchemy session
+        attachment_id: Internal attachment ID
+        
+    Returns:
+        Tuple of (width, height) or None if not an image or failed
+    """
+    
+    attachment = db.scalar(
+        select(EmailAttachment).where(EmailAttachment.id == attachment_id)
+    )
+    
     if not attachment or not attachment.content:
         return None
-    if not (attachment.mime_type or "").lower().startswith("image/"):
+    
+    mime_type = (attachment.mime_type or "").lower()
+    
+    if not mime_type.startswith("image/"):
         return None
-
+    
     try:
         from PIL import Image
-        with Image.open(BytesIO(attachment.content)) as image:
-            return image.size
-    except Exception:
-        logger.exception(
-            "Failed to read image dimensions for attachment %s",
-            attachment_id,
-        )
+        
+        img = Image.open(BytesIO(attachment.content))
+        return img.size  # (width, height)
+        
+    except Exception as e:
+        logger.error(f"Failed to get image dimensions for attachment {attachment_id}: {str(e)}")
         return None

@@ -1,4 +1,4 @@
-from contextlib import asynccontextmanager
+﻿from contextlib import asynccontextmanager
 import logging
 
 from fastapi import FastAPI, Request, Depends
@@ -172,10 +172,14 @@ def mcp_info():
                 "get_email",
                 "list_emails",
                 "get_thread",
-                "search_emails_with_attachments",
+                "search_by_sender",
+                "search_by_subject",
+                "search_by_date",
                 "list_attachments",
                 "get_attachment_content",
                 "extract_attachment_text",
+                "get_email_with_attachments",
+                "search_emails_with_attachments",
             ]
         },
     }
