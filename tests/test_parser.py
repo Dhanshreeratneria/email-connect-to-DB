@@ -13,7 +13,7 @@ def test_parse_plain_email():
                 {"name": "To", "value": "bob@example.com"},
                 {"name": "Subject", "value": "Hello"},
             ],
-            "mimeType": "text/plain",
+            "mime_type": "text/plain",
             "body": {"data": "SGVsbG8="},
         },
     }
@@ -42,7 +42,7 @@ def test_parse_email_tags_to_cc_bcc_separately():
                 {"name": "Bcc", "value": "hidden@example.com"},
                 {"name": "Subject", "value": "Hello"},
             ],
-            "mimeType": "text/plain",
+            "mime_type": "text/plain",
             "body": {"data": ""},
         },
     }
@@ -71,10 +71,10 @@ def test_parse_email_with_attachment_includes_friendly_type():
                 {"name": "To", "value": "bob@example.com"},
                 {"name": "Subject", "value": "Photo"},
             ],
-            "mimeType": "multipart/mixed",
+            "mime_type": "multipart/mixed",
             "parts": [
                 {
-                    "mimeType": "image/jpeg",
+                    "mime_type": "image/jpeg",
                     "filename": "1000210177.jpg",
                     "body": {"attachmentId": "att1", "size": 42613},
                 }

@@ -233,7 +233,7 @@ def parse_message(message: dict[str, Any]) -> dict[str, Any]:
     attachments: list[dict[str, Any]] = []
 
     def walk_part(part: dict[str, Any]) -> None:
-        mime_type = part.get("mimeType", "")
+        mime_type = part.get("mime_type", "")
         body = part.get("body") or {}
         filename = part.get("filename") or ""
 
