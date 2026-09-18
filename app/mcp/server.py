@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from app.config import settings
-from app.db import SessionLocal
+from app.database import SessionLocal
 from app.models.email import Email, EmailAttachment
 
 
@@ -312,7 +312,7 @@ def search_emails(
     limit = max(1, min(limit, 100))
     query = (query or "").strip()
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
         stmt = select(Email)
 
@@ -334,7 +334,7 @@ def search_emails(
             Email.received_at.desc()
         ).limit(limit)
 
-        emails = db.execute(stmt).scalars().all()
+        emails = database.execute(stmt).scalars().all()
 
         return [
             serialize_email(email)
@@ -355,9 +355,9 @@ def get_email(
     Get complete details of one email by database ID.
     """
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
-        email = db.get(
+        email = database.get(
             Email,
             email_id,
         )
@@ -387,7 +387,7 @@ def list_emails(
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
         stmt = (
             select(Email)
@@ -398,7 +398,7 @@ def list_emails(
             .limit(limit)
         )
 
-        emails = db.execute(stmt).scalars().all()
+        emails = database.execute(stmt).scalars().all()
 
         return [
             serialize_email(email)
@@ -427,7 +427,7 @@ def get_thread(
 
     limit = max(1, min(limit, 200))
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
         stmt = (
             select(Email)
@@ -440,7 +440,7 @@ def get_thread(
             .limit(limit)
         )
 
-        emails = db.execute(stmt).scalars().all()
+        emails = database.execute(stmt).scalars().all()
 
         return [
             serialize_email(email)
@@ -480,7 +480,7 @@ def search_emails_with_attachments(
         attachment_type or "any"
     ).lower().strip()
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
         stmt = (
             select(Email)
@@ -536,7 +536,7 @@ def search_emails_with_attachments(
             .limit(limit)
         )
 
-        emails = db.execute(stmt).scalars().all()
+        emails = database.execute(stmt).scalars().all()
 
         return [
             serialize_email(email)
@@ -557,9 +557,9 @@ def list_attachments(
     List all PostgreSQL-stored attachments for an email.
     """
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
-        email = db.get(
+        email = database.get(
             Email,
             email_id,
         )
@@ -578,7 +578,7 @@ def list_attachments(
         )
 
         attachments = (
-            db.execute(stmt)
+            database.execute(stmt)
             .scalars()
             .all()
         )
@@ -609,9 +609,9 @@ def get_attachment_content(
       Returns metadata and a download URL.
     """
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
-        attachment = db.get(
+        attachment = database.get(
             EmailAttachment,
             attachment_id,
         )
@@ -652,9 +652,9 @@ def extract_attachment_text(
         extract_text_from_attachment,
     )
 
-    with SessionLocal() as db:
+    with SessionLocal() as database:
 
-        attachment = db.get(
+        attachment = database.get(
             EmailAttachment,
             attachment_id,
         )
