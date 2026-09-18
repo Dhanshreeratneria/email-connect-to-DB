@@ -238,63 +238,53 @@ def _get_existing_delivery(
         .limit(1)
     )
 
+def _get_or_create_email(db: Session, parsed_email: dict):
+    rfc_message_id = parsed_email.get("rfc_message_id")
 
-def _get_or_create_email(
-    db: Session,
-    parsed: dict[str, Any],
-) -> Email:
-    """
-    Get the canonical Email row using RFC Message-ID.
-
-    Email.rfc_message_id represents the real-world email and is
-    therefore different from Gmail's per-account message ID.
-    """
-
-    rfc_message_id = parsed.get("rfc_message_id")
-
-    # --------------------------------------------------------
-    # Existing email by RFC Message-ID
-    # --------------------------------------------------------
-    if rfc_message_id:
-        existing = db.scalar(
-            select(Email)
-            .where(Email.rfc_message_id == rfc_message_id)
-            .limit(1)
+    existing = db.scalar(
+        select(Email).where(
+            Email.rfc_message_id == rfc_message_id
         )
+    )
 
-        if existing is not None:
-            return existing
+    if existing:
+        return existing
 
-    # --------------------------------------------------------
-    # No existing email -> create it
-    # --------------------------------------------------------
-    email = Email(**parsed)
-
-    db.add(email)
+    email = Email(
+        rfc_message_id=rfc_message_id,
+        thread_id=parsed_email.get("thread_id"),
+        sender_name=parsed_email.get("sender_name"),
+        sender_email=parsed_email.get("sender_email"),
+        recipients=parsed_email.get("recipients"),
+        subject=parsed_email.get("subject"),
+        body_text=parsed_email.get("body_text"),
+        received_at=parsed_email.get("received_at"),
+        labels=parsed_email.get("labels"),
+        category=parsed_email.get("category"),
+        has_attachments=parsed_email.get("has_attachments", False),
+        attachments=parsed_email.get("attachments"),
+    )
 
     try:
-        # Flush so email.id is available for EmailDelivery and
-        # EmailAttachment.
         with db.begin_nested():
+            db.add(email)
             db.flush()
 
         return email
 
     except IntegrityError:
-        # Another concurrent sync may have inserted the same
-        # RFC Message-ID.
-        if rfc_message_id:
-            existing = db.scalar(
-                select(Email)
-                .where(Email.rfc_message_id == rfc_message_id)
-                .limit(1)
-            )
+        db.rollback()
 
-            if existing is not None:
-                return existing
+        existing = db.scalar(
+            select(Email).where(
+                Email.rfc_message_id == rfc_message_id
+            )
+        )
+
+        if existing:
+            return existing
 
         raise
-
 
 def _determine_delivery_type(
     account: GmailAccount,
