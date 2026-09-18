@@ -10,6 +10,8 @@ Handles:
 
 import base64
 import logging
+import os
+import shutil
 import time
 from io import BytesIO
 from typing import Optional, Tuple
@@ -25,6 +27,45 @@ logger = logging.getLogger(__name__)
 
 # Delay between API calls to avoid rate limiting
 API_CALL_DELAY = 0.1
+
+# OCR: point pytesseract at the tesseract binary. TESSERACT_CMD lets you
+# override this (e.g. a specific install path); otherwise it's looked up
+# on PATH, which is where `apt-get install tesseract-ocr` puts it. If
+# tesseract isn't installed at all, OCR is skipped rather than crashing
+# (see _ocr_image below) — install it with your platform's package
+# manager (e.g. `apt-get install -y tesseract-ocr` in your Dockerfile/
+# build step on Render) to actually enable OCR.
+_TESSERACT_CMD = os.getenv("TESSERACT_CMD") or shutil.which("tesseract")
+
+if _TESSERACT_CMD:
+    import pytesseract
+    pytesseract.pytesseract.tesseract_cmd = _TESSERACT_CMD
+
+
+def _ocr_image_bytes(image_bytes: bytes) -> Optional[str]:
+    """
+    Runs OCR on raw image bytes and returns the extracted text, or None
+    if OCR isn't available (tesseract not installed) or found no text.
+    """
+    if not _TESSERACT_CMD:
+        logger.warning(
+            "OCR skipped: tesseract binary not found. Set TESSERACT_CMD "
+            "or install tesseract-ocr on this machine."
+        )
+        return None
+
+    try:
+        import pytesseract
+        from PIL import Image
+
+        with Image.open(BytesIO(image_bytes)) as img:
+            text = pytesseract.image_to_string(img)
+
+        return text.strip() or None
+
+    except Exception as e:
+        logger.error(f"OCR failed: {str(e)}")
+        return None
 
 
 def download_and_store_attachment(
@@ -217,7 +258,10 @@ def extract_text_from_attachment(
     Attempts to extract plain text from various document types.
     
     Supported formats:
-    - PDF (via PyMuPDF/fitz)
+    - Images (via OCR — pytesseract)
+    - PDF (via PyMuPDF/fitz; pages with no extractable text — i.e.
+      scanned/image-only pages — fall back to OCR on a rendered image
+      of that page, so mixed and fully-scanned PDFs are also covered)
     - DOCX (via python-docx)
     - XLSX (via openpyxl)
     - PPTX (via python-pptx)
@@ -242,13 +286,40 @@ def extract_text_from_attachment(
     mime_type = (attachment.mime_type or "").lower()
     
     try:
+        # Image OCR
+        if mime_type.startswith("image/"):
+            return _ocr_image_bytes(attachment.content)
+
         # PDF extraction
         if "pdf" in mime_type:
             import fitz  # PyMuPDF
             
             doc = fitz.open(stream=attachment.content, filetype="pdf")
-            text = "\n".join(page.get_text() for page in doc)
+            page_texts = []
+
+            for page in doc:
+                text = page.get_text().strip()
+
+                if text:
+                    page_texts.append(text)
+                    continue
+
+                # No extractable text on this page — likely a scanned
+                # page. Render it to an image and OCR that instead.
+                try:
+                    pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    ocr_text = _ocr_image_bytes(pixmap.tobytes("png"))
+
+                    if ocr_text:
+                        page_texts.append(ocr_text)
+                except Exception as e:
+                    logger.warning(
+                        f"OCR fallback failed for a page in attachment "
+                        f"{attachment_id}: {str(e)}"
+                    )
+
             doc.close()
+            text = "\n".join(page_texts)
             return text.strip() if text.strip() else None
         
         # DOCX extraction
