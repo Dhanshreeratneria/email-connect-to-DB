@@ -10,9 +10,14 @@ New Features:
 All attachments stored in PostgreSQL are now accessible to Claude.
 """
 
+import base64
 from datetime import datetime
+from urllib.parse import quote
+
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
+from mcp.types import TextContent, ImageContent, EmbeddedResource, BlobResourceContents
+
 from app.database import SessionLocal
 from app.models.email import Email, EmailDelivery, EmailAttachment
 from app.services.attachment_service import (
@@ -100,6 +105,46 @@ def serialize_attachment(att: EmailAttachment, include_content: bool = False):
         result["content_base64"] = base64.b64encode(att.content).decode("utf-8")
     
     return result
+
+
+def attachment_to_content_blocks(att: EmailAttachment) -> list:
+    """
+    Converts one stored attachment into real MCP content blocks instead of a
+    JSON blob with a base64 string field.
+
+    - image/*        -> ImageContent, so Claude renders it inline.
+    - everything else (PDF, docx, xlsx, zip, ...) -> EmbeddedResource with a
+      blob, so Claude shows/download the actual file instead of raw text.
+
+    This is what actually makes attachments show up and be downloadable in
+    Claude; returning a dict with a "content_base64" key only produces one
+    big TextContent block that Claude can't render as a file.
+    """
+    if not att.content:
+        return [
+            TextContent(
+                type="text",
+                text=f"'{att.filename}' has no stored content and can't be displayed.",
+            )
+        ]
+
+    mime_type = (att.mime_type or "application/octet-stream").lower()
+    b64 = base64.b64encode(att.content).decode("utf-8")
+
+    if mime_type.startswith("image/"):
+        return [ImageContent(type="image", data=b64, mimeType=mime_type)]
+
+    uri = f"attachment://{att.id}/{quote(att.filename or 'attachment')}"
+    return [
+        EmbeddedResource(
+            type="resource",
+            resource=BlobResourceContents(
+                uri=uri,
+                mimeType=mime_type,
+                blob=b64,
+            ),
+        )
+    ]
 
 
 def query(stmt):
@@ -240,58 +285,48 @@ def list_attachments(email_id: int) -> list[dict]:
         db.close()
 
 
-@mcp.tool()
-def get_attachment_content(attachment_id: int, return_base64: bool = True) -> dict:
+@mcp.tool(structured_output=False)
+def get_attachment_content(attachment_id: int, return_base64: bool = True):
     """
-    Retrieve attachment content for display or download.
-    
+    Retrieve one attachment so Claude can actually display/download it.
+
+    Images (JPEG, PNG, GIF, WebP) render inline. PDFs and any other file
+    type (docx, xlsx, zip, ...) come back as an embedded resource with a
+    download affordance in Claude.
+
     Args:
         attachment_id: Internal attachment ID (from list_attachments)
-        return_base64: If True, returns content as base64 (for Claude display).
-                      If False, returns only metadata.
-    
-    Returns:
-    {
-        "filename": str,
-        "mime_type": str,
-        "size": int,
-        "is_displayable": bool,
-        "content_base64": str (only if return_base64=True and content exists),
-        "download_url": str (for HTTP download)
-    }
-    
-    For images (JPEG, PNG, GIF, WebP): Include content_base64 to display directly
-    For PDFs: Include content_base64 to preview
-    For text files: Include content_base64 to read inline
+        return_base64: If True (default), includes the actual file so it can
+                      be shown/downloaded. If False, returns metadata only.
     """
     db = SessionLocal()
     try:
         attachment = db.scalar(
             select(EmailAttachment).where(EmailAttachment.id == attachment_id)
         )
-        
+
         if not attachment:
-            return {"error": f"Attachment with ID {attachment_id} not found"}
-        
-        result = {
-            "filename": attachment.filename,
-            "mime_type": attachment.mime_type,
-            "size": attachment.size,
-            "is_displayable": is_displayable_in_claude(attachment.mime_type),
-            "has_content": attachment.content is not None,
-        }
-        
-        # Include base64 content if requested and available
-        if return_base64 and attachment.content:
-            import base64
-            result["content_base64"] = base64.b64encode(attachment.content).decode("utf-8")
-            result["content_size_kb"] = len(result["content_base64"]) / 1024
-        
-        # Email ID for download URL
-        if attachment.email_id:
-            result["download_url"] = f"/api/emails/{attachment.email_id}/attachments/{attachment_id}/download"
-        
-        return result
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Attachment with ID {attachment_id} not found.",
+                )
+            ]
+
+        size_kb = (attachment.size or 0) / 1024
+        meta = TextContent(
+            type="text",
+            text=(
+                f"📎 {attachment.filename}\n"
+                f"Type: {attachment.mime_type or 'unknown'}\n"
+                f"Size: {size_kb:.1f} KB"
+            ),
+        )
+
+        if not return_base64:
+            return [meta]
+
+        return [meta, *attachment_to_content_blocks(attachment)]
     finally:
         db.close()
 
@@ -353,52 +388,72 @@ def extract_attachment_text(attachment_id: int) -> dict:
         db.close()
 
 
-@mcp.tool()
-def get_email_with_attachments(email_id: int, include_content: bool = False) -> dict:
+@mcp.tool(structured_output=False)
+def get_email_with_attachments(email_id: int, include_content: bool = True):
     """
-    Get a complete email including all attachments with their content.
-    
+    Get a complete email formatted for reading, with attachments actually
+    rendered/downloadable in Claude (not just described in JSON).
+
     Args:
         email_id: Internal email ID
-        include_content: If True, includes base64 content for all attachments
-                        (careful: large attachments will make response large)
-    
-    Returns: Email dict with attachments array containing:
-    {
-        ...email fields...
-        "stored_attachments": [
-            {
-                "id": int,
-                "filename": str,
-                "mime_type": str,
-                "size": int,
-                "is_displayable": bool,
-                "content_base64": str (if include_content=True)
-            },
-            ...
-        ]
-    }
+        include_content: If True (default), renders each stored attachment:
+                        images inline, everything else (PDF, docx, xlsx, ...)
+                        as a downloadable file. Set False for text-only output.
     """
     db = SessionLocal()
     try:
         email = db.scalar(select(Email).where(Email.id == email_id))
-        
+
         if not email:
-            return {"error": f"Email with ID {email_id} not found"}
-        
-        result = serialize(email)
-        
-        # Add attachments with content
+            return [
+                TextContent(type="text", text=f"Email with ID {email_id} not found.")
+            ]
+
+        recipients = group_recipients(email.recipients)
+
+        def fmt_people(people: list[dict]) -> str:
+            parts = []
+            for p in people:
+                name, addr = p.get("name"), p.get("email")
+                parts.append(f"{name} <{addr}>" if name else str(addr))
+            return ", ".join(parts) if parts else "(none)"
+
         attachments = db.scalars(
             select(EmailAttachment).where(EmailAttachment.email_id == email_id)
         ).all()
-        
-        result["stored_attachments"] = [
-            serialize_attachment(att, include_content=include_content)
-            for att in attachments
+
+        lines = [
+            "📧 EMAIL DETAILS",
+            f"From: {email.sender_name} <{email.sender_email}>"
+            if email.sender_name
+            else f"From: {email.sender_email}",
+            f"To: {fmt_people(recipients['to'])}",
         ]
-        
-        return result
+        if recipients["cc"]:
+            lines.append(f"Cc: {fmt_people(recipients['cc'])}")
+        lines += [
+            f"Subject: {email.subject or '(no subject)'}",
+            f"Date: {email.received_at.strftime('%B %d, %Y')}",
+            "",
+            "📝 EMAIL BODY:",
+            email.body_text or "(no body text)",
+        ]
+
+        if attachments:
+            lines += ["", "📎 ATTACHMENTS"]
+            for att in attachments:
+                size_kb = (att.size or 0) / 1024
+                lines.append(
+                    f"- {att.filename} ({size_kb:.1f} KB, {att.mime_type or 'unknown type'})"
+                )
+
+        blocks: list = [TextContent(type="text", text="\n".join(lines))]
+
+        if include_content:
+            for att in attachments:
+                blocks.extend(attachment_to_content_blocks(att))
+
+        return blocks
     finally:
         db.close()
 
