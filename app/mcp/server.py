@@ -4,6 +4,7 @@ import base64
 import logging
 from typing import Any
 
+
 from sqlalchemy import or_, select
 
 from mcp.server.fastmcp import FastMCP
@@ -146,84 +147,40 @@ def attachment_download_url(attachment_id: int) -> str:
     )
 
 
-def attachment_to_content_blocks(
-    attachment: EmailAttachment,
-) -> list[TextContent | ImageContent]:
-    """
-    Convert an attachment into MCP content blocks.
 
-    Images are returned as MCP ImageContent so Claude can
-    receive the actual image data.
+def attachment_to_content_blocks(attachment):
+    if not attachment.content:
+        return [
+            TextContent(
+                type="text",
+                text=f"Attachment content is not stored: {attachment.filename}"
+            )
+        ]
 
-    Other attachments return metadata and a download URL.
-    """
-
-    mime_type = (
-        attachment.mime_type
-        or "application/octet-stream"
-    ).lower()
-
-    filename = attachment.filename or "attachment"
-
-    # --------------------------------------------------------
-    # IMAGE ATTACHMENT
-    # --------------------------------------------------------
+    mime_type = attachment.mime_type or "application/octet-stream"
 
     if mime_type.startswith("image/"):
-
-        if not attachment.content:
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"Image attachment '{filename}' was found, "
-                        "but its binary content is not stored "
-                        "in PostgreSQL."
-                    ),
-                )
-            ]
-
-        encoded = base64.b64encode(
-            attachment.content
-        ).decode("utf-8")
+        encoded = base64.b64encode(attachment.content).decode("utf-8")
 
         return [
             TextContent(
                 type="text",
-                text=(
-                    f"Image attachment: {filename}\n"
-                    f"MIME type: {mime_type}\n"
-                    f"Size: {attachment.size or 0} bytes"
-                ),
+                text=f"Image: {attachment.filename}"
             ),
-
-           ImageContent(
-    type="image",
-    data=encoded,
-    mime_type=mime_type,
-)
+            ImageContent(
+                type="image",
+                data=encoded,
+                mime_type=mime_type,
+            ),
         ]
-
-    # --------------------------------------------------------
-    # NON-IMAGE ATTACHMENT
-    # --------------------------------------------------------
 
     return [
         TextContent(
             type="text",
-            text=(
-                f"Attachment: {filename}\n"
-                f"MIME type: {mime_type}\n"
-                f"Size: {attachment.size or 0} bytes\n"
-                f"Content stored: "
-                f"{attachment.content is not None}\n"
-                f"Download URL: "
-                f"{attachment_download_url(attachment.id)}"
-            ),
+            text=f"Attachment: {attachment.filename}\n"
+                 f"MIME type: {mime_type}"
         )
     ]
-
-
 def attachment_type_condition(
     attachment_type: str,
 ):
@@ -594,43 +551,24 @@ def list_attachments(
 # GET ATTACHMENT CONTENT
 # ============================================================
 
-@mcp.tool(structured_output=False)
-def get_attachment_content(
-    attachment_id: int,
-) -> list[TextContent | ImageContent]:
-    """
-    Get the actual content of an attachment.
+@mcp.tool()
+def get_attachment_content(attachment_id: int):
+    db = SessionLocal()
 
-    For images:
-      Returns MCP ImageContent so Claude can receive
-      and visually inspect the image.
-
-    For other files:
-      Returns metadata and a download URL.
-    """
-
-    with SessionLocal() as database:
-
-        attachment = database.get(
-            EmailAttachment,
-            attachment_id,
+    try:
+        attachment = (
+            db.query(EmailAttachment)
+            .filter(EmailAttachment.id == attachment_id)
+            .first()
         )
 
         if not attachment:
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        f"Attachment "
-                        f"{attachment_id} not found."
-                    ),
-                )
-            ]
+            return "Attachment not found"
 
-        return attachment_to_content_blocks(
-            attachment
-        )
+        return attachment_to_content_blocks(attachment)
 
+    finally:
+        db.close()
 
 # ============================================================
 # TOOL 8
