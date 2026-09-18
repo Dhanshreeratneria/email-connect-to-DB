@@ -197,11 +197,11 @@ def attachment_to_content_blocks(
                 ),
             ),
 
-            ImageContent(
-                type="image",
-                data=encoded,
-                mime_type=mime_type,
-            ),
+           ImageContent(
+    type="image",
+    data=encoded,
+    mime_type=mime_type,
+)
         ]
 
     # --------------------------------------------------------
