@@ -25,6 +25,7 @@ from app.services.attachment_service import (
     get_image_dimensions,
     is_displayable_in_claude,
 )
+from app.services.sync_service import backfill_missing_attachments
 from app.schemas.email import AttachmentOut
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,30 @@ router = APIRouter()
 # ============================================================================
 # NEW ATTACHMENT-SPECIFIC ENDPOINTS
 # ============================================================================
+
+@router.post("/attachments/backfill")
+async def backfill_attachments(
+    limit: Optional[int] = Query(
+        None, description="Max emails to backfill in this call. Omit for all."
+    ),
+    db: Session = Depends(get_db),
+) -> dict:
+    """
+    Downloads attachment bytes for already-synced emails whose metadata
+    says they have attachments but whose content was never stored (e.g.
+    emails synced before attachment downloading was fully wired up —
+    those were permanently stuck at stored_attachments_count: 0).
+
+    Safe to call repeatedly: each attachment is only downloaded once
+    (existing rows are skipped), so this is a no-op once everything is
+    backfilled.
+    """
+    try:
+        return backfill_missing_attachments(db, limit=limit)
+    except Exception as e:
+        logger.error(f"Attachment backfill failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {str(e)}")
+
 
 @router.get("/attachments/{attachment_id}/metadata")
 async def get_attachment_metadata(

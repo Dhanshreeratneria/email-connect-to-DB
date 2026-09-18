@@ -171,7 +171,31 @@ def record_email_delivery(
     )
 
     if existing_delivery:
-        return existing_delivery.email, 0, 0
+        # BUG FIX: this used to return immediately with (email, 0, 0) and
+        # never touch attachments. Any email that was already recorded for
+        # this account BEFORE attachment downloading existed (or that was
+        # re-delivered to an account that had already seen it) stayed
+        # permanently stuck with stored_attachments_count: 0 — there was
+        # no code path that ever went back and downloaded its attachment
+        # bytes. store_attachments() already de-dupes per
+        # (email_id, gmail_attachment_id), so calling it here is safe and
+        # only actually hits the Gmail API for attachments still missing.
+        email = existing_delivery.email
+        stored = failed = 0
+        if gmail_service is not None and email.attachments:
+            stored, failed = store_attachments(
+                db=db,
+                email=email,
+                gmail_service=gmail_service,
+                gmail_message_id=gmail_message_id,
+                attachments_meta=email.attachments,
+            )
+            if stored or failed:
+                logger.info(
+                    f"Backfilled attachments for already-delivered email "
+                    f"{email.id}: {stored} stored, {failed} failed"
+                )
+        return email, stored, failed
 
     parsed = parse_message(gmail_message)
 
@@ -229,6 +253,108 @@ def record_email_delivery(
     db.add(delivery)
 
     return email, attachments_stored, attachments_failed
+
+
+def backfill_missing_attachments(
+    db: Session,
+    limit: Optional[int] = None,
+) -> dict:
+    """
+    Downloads attachment bytes for emails that already exist in the
+    database, whose metadata (Email.attachments) says they have
+    attachments, but whose email_attachments rows are missing or
+    incomplete — e.g. emails synced back when attachment downloading
+    either didn't exist yet or was skipped because the account's
+    delivery row already existed (see the BUG FIX note in
+    record_email_delivery above).
+
+    Unlike initial_sync/incremental_sync, this does NOT call Gmail's
+    message-list or history APIs — it only re-fetches the specific
+    attachment bytes for emails already stored, using each email's
+    existing EmailDelivery row to know which connected account's Gmail
+    API credentials and gmail_message_id to use.
+
+    Args:
+        db: SQLAlchemy session
+        limit: Max number of emails to backfill in this call (omit for
+               all outstanding emails — useful to call repeatedly / from
+               a scheduled job on a large backlog)
+
+    Returns:
+        {
+            "emails_checked": int,
+            "emails_backfilled": list[int],   # Email.id values touched
+            "attachments_stored": int,
+            "attachments_failed": int,
+        }
+    """
+    from app.services.gmail_service import gmail
+    from app.services.oauth_service import decrypt_credentials
+
+    accounts = db.scalars(select(GmailAccount)).all()
+
+    services_by_account_id: dict[int, object] = {}
+    for account in accounts:
+        try:
+            services_by_account_id[account.id] = gmail(
+                decrypt_credentials(account.encrypted_token)
+            )
+        except Exception:
+            logger.exception(
+                f"backfill_missing_attachments: could not build Gmail "
+                f"client for {account.google_email}, skipping its emails"
+            )
+
+    stmt = select(Email).where(Email.has_attachments == True)  # noqa: E712
+    if limit:
+        stmt = stmt.limit(limit)
+
+    emails_checked = 0
+    emails_backfilled: list[int] = []
+    total_stored = 0
+    total_failed = 0
+
+    for email in db.scalars(stmt).all():
+        expected = len(email.attachments or [])
+        if expected == 0:
+            continue
+
+        already_stored = len(email.stored_attachments)
+        if already_stored >= expected:
+            continue
+
+        emails_checked += 1
+
+        delivery = db.scalar(
+            select(EmailDelivery).where(EmailDelivery.email_id == email.id)
+        )
+        if not delivery or delivery.account_id not in services_by_account_id:
+            logger.warning(
+                f"backfill_missing_attachments: no usable Gmail "
+                f"credentials for email {email.id}, skipping"
+            )
+            continue
+
+        stored, failed = store_attachments(
+            db=db,
+            email=email,
+            gmail_service=services_by_account_id[delivery.account_id],
+            gmail_message_id=delivery.gmail_message_id,
+            attachments_meta=email.attachments,
+        )
+        total_stored += stored
+        total_failed += failed
+        if stored:
+            emails_backfilled.append(email.id)
+
+        db.commit()
+
+    return {
+        "emails_checked": emails_checked,
+        "emails_backfilled": emails_backfilled,
+        "attachments_stored": total_stored,
+        "attachments_failed": total_failed,
+    }
 
 
 def initial_sync(

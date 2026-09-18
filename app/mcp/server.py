@@ -22,6 +22,7 @@ from mcp.types import TextContent
 from app.config import settings
 from app.database import SessionLocal
 from app.models.email import Email, EmailDelivery, EmailAttachment
+from app.services.sync_service import backfill_missing_attachments
 from app.services.attachment_service import (
     get_attachment_content_base64,
     get_email_attachments_with_content,
@@ -523,5 +524,39 @@ def search_emails_with_attachments(
             emails = emails[:limit]
         
         return [serialize(e) for e in emails]
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def sync_missing_attachments(limit: int | None = None) -> dict:
+    """
+    Downloads the actual attachment bytes for emails already stored in
+    the database whose metadata says they have attachments but whose
+    content was never downloaded (stored_attachments_count is less than
+    the number of attachments listed) — e.g. emails synced before
+    attachment downloading was fully wired up.
+
+    Call this when list_emails / search results show attachments in
+    metadata but get_attachment_content / get_email_with_attachments
+    can't display or download them (has_content: false, or
+    stored_attachments_count 0 while attachments is non-empty).
+
+    Args:
+        limit: Max number of such emails to backfill in this call. Omit
+               to attempt all of them (may take a while on a large
+               backlog — call again with a limit if it times out).
+
+    Returns:
+        {
+            "emails_checked": int,
+            "emails_backfilled": list[int],
+            "attachments_stored": int,
+            "attachments_failed": int,
+        }
+    """
+    db = SessionLocal()
+    try:
+        return backfill_missing_attachments(db, limit=limit)
     finally:
         db.close()
