@@ -1,6 +1,9 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+from app.config import settings
+from app.services.attachment_service import is_displayable_in_claude
 
 
 class EmailOut(BaseModel):
@@ -35,9 +38,22 @@ class AttachmentOut(BaseModel):
     filename: str
     mime_type: str | None
     size: int | None
+    # BUG FIX: these two were missing, so every attachment listed via
+    # GET /emails/{message_id}/attachments came back with no way to know
+    # whether Claude/VS Code could preview it or where to download it from
+    # — callers had to hand-build the URL themselves from `id`.
+    is_displayable: bool = False
+    download_url: str = ""
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="after")
+    def _add_computed_fields(self) -> "AttachmentOut":
+        self.is_displayable = is_displayable_in_claude(self.mime_type)
+        base = settings.public_base_url.rstrip("/")
+        self.download_url = f"{base}/attachments/{self.id}/download"
+        return self
 
 
 class EmailDeliveryOut(BaseModel):
