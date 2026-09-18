@@ -1,23 +1,31 @@
 """
 MCP Server for Gmail Email Search with attachment support.
 
-Attachments (images, PDFs, and other files) are served from real HTTPS
-download URLs rather than embedded as base64 in tool results — embedding
-large base64 blobs directly in MCP tool output does not render reliably.
+Images are sent as real inline MCP ImageContent blocks (actual base64
+image bytes + mimeType, the protocol's native way to return an image) so
+Claude renders the picture itself — not just a markdown link pointing at
+an HTTPS URL, which depends on the client choosing to fetch and render
+an arbitrary external image link and was producing descriptions instead
+of the actual picture. Every attachment (image or not) also always gets
+a real, directly-fetchable HTTPS download link.
 
-- get_attachment_content: Returns an attachment's image/download link
+- get_attachment_content: Returns an attachment inline (image) or a
+  download link (everything else — PDF, docx, xlsx, zip, ...)
 - extract_attachment_text: Extracts text from PDFs, docs, spreadsheets, etc.
-- get_email_with_attachments: Returns email with attachment links inline
+- get_email_with_attachments: Returns email with attachments rendered inline
 - list_attachments: List attachments for an email with displayable status
+- sync_missing_attachments: Backfills attachment bytes for emails that
+  were synced before their content was downloaded
 
 All attachments stored in PostgreSQL are accessible to Claude.
 """
 
+import base64
 from datetime import datetime
 
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent
+from mcp.types import ImageContent, TextContent
 
 from app.config import settings
 from app.database import SessionLocal
@@ -29,6 +37,15 @@ from app.services.attachment_service import (
     extract_text_from_attachment,
     is_displayable_in_claude,
 )
+
+# Above this size, an image is sent as a download link only instead of an
+# inline ImageContent block — large base64 payloads in a single MCP tool
+# result can blow past transport/context limits.
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+INLINE_IMAGE_MIME_TYPES = {
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+}
 
 mcp = FastMCP(
     "Gmail Email Search",
@@ -118,41 +135,65 @@ def attachment_download_url(att: EmailAttachment) -> str:
 
 def attachment_to_content_blocks(att: EmailAttachment) -> list:
     """
-    Builds a real, publicly fetchable link for one stored attachment.
+    Builds the actual displayable/downloadable content for one stored
+    attachment.
 
-    Images are embedded with markdown image syntax pointing at a genuine
-    HTTPS URL, so the browser fetches and renders the actual bytes. This
-    replaces an earlier approach of inlining the whole file as a giant
-    base64 string in the tool result: that data doesn't survive the MCP
-    transport reliably for anything but tiny files and was producing
-    broken/blank images with no working download link. Every attachment
-    (image, PDF, or anything else) also gets an explicit download link.
+    - Images (JPEG/PNG/GIF/WebP) under MAX_INLINE_IMAGE_BYTES: sent as a
+      real MCP ImageContent block (the raw bytes, base64-encoded, with
+      their mimeType) — this is the protocol's native image type, so
+      Claude renders the actual picture directly instead of needing to
+      fetch and render an external link.
+    - Everything else (PDF, docx, xlsx, zip, oversized images, ...):
+      returned as an explicit, directly-fetchable HTTPS download link.
+
+    Every attachment also always gets its download link included, so the
+    file can be saved regardless of whether it was also shown inline.
     """
     if not att.content:
         return [
             TextContent(
                 type="text",
-                text=f"'{att.filename}' has no stored content and can't be displayed.",
+                text=f"'{att.filename}' has no stored content and can't be "
+                     f"displayed. Try calling sync_missing_attachments to "
+                     f"download it, then retry.",
             )
         ]
 
     url = attachment_download_url(att)
     mime_type = (att.mime_type or "").lower()
-    size_kb = (att.size or 0) / 1024
+    size_bytes = att.size or len(att.content)
+    size_kb = size_bytes / 1024
+
+    download_line = TextContent(
+        type="text",
+        text=f"⬇️ [Download {att.filename} ({size_kb:.1f} KB)]({url})",
+    )
+
+    if mime_type in INLINE_IMAGE_MIME_TYPES and size_bytes <= MAX_INLINE_IMAGE_BYTES:
+        image_block = ImageContent(
+            type="image",
+            data=base64.b64encode(att.content).decode("utf-8"),
+            mimeType=att.mime_type,
+        )
+        return [image_block, download_line]
 
     if mime_type.startswith("image/"):
-        text = (
-            f"![{att.filename}]({url})\n\n"
-            f"⬇️ [Download {att.filename} ({size_kb:.1f} KB)]({url})"
-        )
+        # SVG or an oversized raster image: no reliable inline render,
+        # link only.
+        label = "🖼️"
+    elif "pdf" in mime_type:
+        label = "📄"
     else:
-        label = "📄" if "pdf" in mime_type else "📎"
-        text = (
-            f"{label} [Download {att.filename} "
-            f"({size_kb:.1f} KB, {att.mime_type or 'unknown type'})]({url})"
-        )
+        label = "📎"
 
-    return [TextContent(type="text", text=text)]
+    return [
+        TextContent(
+            type="text",
+            text=f"{label} {att.filename} ({size_kb:.1f} KB, "
+                 f"{att.mime_type or 'unknown type'})",
+        ),
+        download_line,
+    ]
 
 
 def query(stmt):
@@ -298,7 +339,7 @@ def get_attachment_content(attachment_id: int, include_link: bool = True):
     """
     Retrieve one attachment so Claude can actually display/download it.
 
-    Images render inline (fetched from a real URL, not embedded base64).
+    Images render inline (real MCP image content, not just a link).
     PDFs and any other file type (docx, xlsx, zip, ...) get an explicit
     download link.
 
