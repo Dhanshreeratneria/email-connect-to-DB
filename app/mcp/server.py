@@ -1,23 +1,25 @@
 """
-Updated MCP Server for Gmail Email Search with full attachment support.
+MCP Server for Gmail Email Search with attachment support.
 
-New Features:
-- get_attachment_content: Returns attachment as base64 for display in Claude
+Attachments (images, PDFs, and other files) are served from real HTTPS
+download URLs rather than embedded as base64 in tool results — embedding
+large base64 blobs directly in MCP tool output does not render reliably.
+
+- get_attachment_content: Returns an attachment's image/download link
 - extract_attachment_text: Extracts text from PDFs, docs, spreadsheets, etc.
-- get_email_with_attachments: Returns email with all attachments as base64
+- get_email_with_attachments: Returns email with attachment links inline
 - list_attachments: List attachments for an email with displayable status
 
-All attachments stored in PostgreSQL are now accessible to Claude.
+All attachments stored in PostgreSQL are accessible to Claude.
 """
 
-import base64
 from datetime import datetime
-from urllib.parse import quote
 
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
-from mcp.types import TextContent, ImageContent, EmbeddedResource, BlobResourceContents
+from mcp.types import TextContent
 
+from app.config import settings
 from app.database import SessionLocal
 from app.models.email import Email, EmailDelivery, EmailAttachment
 from app.services.attachment_service import (
@@ -107,18 +109,23 @@ def serialize_attachment(att: EmailAttachment, include_content: bool = False):
     return result
 
 
+def attachment_download_url(att: EmailAttachment) -> str:
+    """Public, directly-fetchable HTTPS URL for one stored attachment."""
+    base = settings.public_base_url.rstrip("/")
+    return f"{base}/attachments/{att.id}/download"
+
+
 def attachment_to_content_blocks(att: EmailAttachment) -> list:
     """
-    Converts one stored attachment into real MCP content blocks instead of a
-    JSON blob with a base64 string field.
+    Builds a real, publicly fetchable link for one stored attachment.
 
-    - image/*        -> ImageContent, so Claude renders it inline.
-    - everything else (PDF, docx, xlsx, zip, ...) -> EmbeddedResource with a
-      blob, so Claude shows/download the actual file instead of raw text.
-
-    This is what actually makes attachments show up and be downloadable in
-    Claude; returning a dict with a "content_base64" key only produces one
-    big TextContent block that Claude can't render as a file.
+    Images are embedded with markdown image syntax pointing at a genuine
+    HTTPS URL, so the browser fetches and renders the actual bytes. This
+    replaces an earlier approach of inlining the whole file as a giant
+    base64 string in the tool result: that data doesn't survive the MCP
+    transport reliably for anything but tiny files and was producing
+    broken/blank images with no working download link. Every attachment
+    (image, PDF, or anything else) also gets an explicit download link.
     """
     if not att.content:
         return [
@@ -128,23 +135,23 @@ def attachment_to_content_blocks(att: EmailAttachment) -> list:
             )
         ]
 
-    mime_type = (att.mime_type or "application/octet-stream").lower()
-    b64 = base64.b64encode(att.content).decode("utf-8")
+    url = attachment_download_url(att)
+    mime_type = (att.mime_type or "").lower()
+    size_kb = (att.size or 0) / 1024
 
     if mime_type.startswith("image/"):
-        return [ImageContent(type="image", data=b64, mimeType=mime_type)]
-
-    uri = f"attachment://{att.id}/{quote(att.filename or 'attachment')}"
-    return [
-        EmbeddedResource(
-            type="resource",
-            resource=BlobResourceContents(
-                uri=uri,
-                mimeType=mime_type,
-                blob=b64,
-            ),
+        text = (
+            f"![{att.filename}]({url})\n\n"
+            f"⬇️ [Download {att.filename} ({size_kb:.1f} KB)]({url})"
         )
-    ]
+    else:
+        label = "📄" if "pdf" in mime_type else "📎"
+        text = (
+            f"{label} [Download {att.filename} "
+            f"({size_kb:.1f} KB, {att.mime_type or 'unknown type'})]({url})"
+        )
+
+    return [TextContent(type="text", text=text)]
 
 
 def query(stmt):
@@ -286,18 +293,18 @@ def list_attachments(email_id: int) -> list[dict]:
 
 
 @mcp.tool(structured_output=False)
-def get_attachment_content(attachment_id: int, return_base64: bool = True):
+def get_attachment_content(attachment_id: int, include_link: bool = True):
     """
     Retrieve one attachment so Claude can actually display/download it.
 
-    Images (JPEG, PNG, GIF, WebP) render inline. PDFs and any other file
-    type (docx, xlsx, zip, ...) come back as an embedded resource with a
-    download affordance in Claude.
+    Images render inline (fetched from a real URL, not embedded base64).
+    PDFs and any other file type (docx, xlsx, zip, ...) get an explicit
+    download link.
 
     Args:
         attachment_id: Internal attachment ID (from list_attachments)
-        return_base64: If True (default), includes the actual file so it can
-                      be shown/downloaded. If False, returns metadata only.
+        include_link: If True (default), includes the image/download link.
+                     If False, returns metadata only.
     """
     db = SessionLocal()
     try:
@@ -323,7 +330,7 @@ def get_attachment_content(attachment_id: int, return_base64: bool = True):
             ),
         )
 
-        if not return_base64:
+        if not include_link:
             return [meta]
 
         return [meta, *attachment_to_content_blocks(attachment)]

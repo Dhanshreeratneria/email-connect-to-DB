@@ -148,6 +148,38 @@ async def get_email_attachments(
     return delivery.email.stored_attachments
 
 
+@router.get("/attachments/{attachment_id}/download")
+async def download_attachment_by_id(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+) -> Response:
+    """
+    Streams a stored attachment's raw bytes by its internal ID alone (no
+    Gmail message_id needed). This gives MCP tools a plain, public,
+    directly-fetchable HTTPS URL to hand Claude for inline image display
+    and real downloads, instead of embedding huge base64 blobs in the tool
+    result (which don't render reliably through the MCP transport).
+
+    "inline" disposition lets browsers/Claude render images and PDFs
+    directly instead of forcing a save dialog, while the file can still be
+    saved normally via right-click / the browser's download control.
+    """
+    attachment = db.scalar(
+        select(EmailAttachment).where(EmailAttachment.id == attachment_id)
+    )
+
+    if not attachment or attachment.content is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    return Response(
+        content=attachment.content,
+        media_type=attachment.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{attachment.filename}"'
+        },
+    )
+
+
 @router.get("/emails/{message_id}/attachments/{attachment_id}/download")
 async def download_email_attachment(
     message_id: str,
