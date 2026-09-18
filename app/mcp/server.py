@@ -1,27 +1,20 @@
 """
 MCP Server for Gmail Email Search with attachment support.
 
-Images are sent as real inline MCP ImageContent blocks (actual base64
-image bytes + mimeType, the protocol's native way to return an image) so
-Claude renders the picture itself — not just a markdown link pointing at
-an HTTPS URL, which depends on the client choosing to fetch and render
-an arbitrary external image link and was producing descriptions instead
-of the actual picture. Every attachment (image or not) also always gets
-a real, directly-fetchable HTTPS download link.
+Attachments (images, PDFs, and other files) are served from real HTTPS
+download URLs rather than embedded as base64 in tool results — embedding
+large base64 blobs directly in MCP tool output does not render reliably.
 
-- get_attachment_content: Returns an attachment inline (image) or a
-  download link (everything else — PDF, docx, xlsx, zip, ...)
+- get_attachment_content: Returns actual image content for images and metadata/download information for files
 - extract_attachment_text: Extracts text from PDFs, docs, spreadsheets, etc.
-- get_email_with_attachments: Returns email with attachments rendered inline
+- get_email_with_attachments: Returns email with attachments, including actual image content
 - list_attachments: List attachments for an email with displayable status
-- sync_missing_attachments: Backfills attachment bytes for emails that
-  were synced before their content was downloaded
 
 All attachments stored in PostgreSQL are accessible to Claude.
 """
 
-import base64
 from datetime import datetime
+import base64
 
 from sqlalchemy import or_, select
 from mcp.server.fastmcp import FastMCP
@@ -30,22 +23,12 @@ from mcp.types import ImageContent, TextContent
 from app.config import settings
 from app.database import SessionLocal
 from app.models.email import Email, EmailDelivery, EmailAttachment
-from app.services.sync_service import backfill_missing_attachments
 from app.services.attachment_service import (
     get_attachment_content_base64,
     get_email_attachments_with_content,
     extract_text_from_attachment,
     is_displayable_in_claude,
 )
-
-# Above this size, an image is sent as a download link only instead of an
-# inline ImageContent block — large base64 payloads in a single MCP tool
-# result can blow past transport/context limits.
-MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
-
-INLINE_IMAGE_MIME_TYPES = {
-    "image/jpeg", "image/png", "image/gif", "image/webp",
-}
 
 mcp = FastMCP(
     "Gmail Email Search",
@@ -135,64 +118,68 @@ def attachment_download_url(att: EmailAttachment) -> str:
 
 def attachment_to_content_blocks(att: EmailAttachment) -> list:
     """
-    Builds the actual displayable/downloadable content for one stored
-    attachment.
+    Return attachment content in a form Claude can consume through MCP.
 
-    - Images (JPEG/PNG/GIF/WebP) under MAX_INLINE_IMAGE_BYTES: sent as a
-      real MCP ImageContent block (the raw bytes, base64-encoded, with
-      their mimeType) — this is the protocol's native image type, so
-      Claude renders the actual picture directly instead of needing to
-      fetch and render an external link.
-    - Everything else (PDF, docx, xlsx, zip, oversized images, ...):
-      returned as an explicit, directly-fetchable HTTPS download link.
-
-    Every attachment also always gets its download link included, so the
-    file can be saved regardless of whether it was also shown inline.
+    Images are returned as real MCP ImageContent containing the original
+    bytes stored in PostgreSQL. Other files are represented by metadata and
+    the existing download URL; document text can be obtained with
+    extract_attachment_text().
     """
     if not att.content:
         return [
             TextContent(
                 type="text",
-                text=f"'{att.filename}' has no stored content and can't be "
-                     f"displayed. Try calling sync_missing_attachments to "
-                     f"download it, then retry.",
+                text=(
+                    f"'{att.filename}' has no stored binary content. "
+                    "It cannot be displayed or downloaded from MCP."
+                ),
             )
         ]
 
-    url = attachment_download_url(att)
-    mime_type = (att.mime_type or "").lower()
-    size_bytes = att.size or len(att.content)
-    size_kb = size_bytes / 1024
+    mime_type = (att.mime_type or "application/octet-stream").lower()
+    size_kb = (att.size or len(att.content)) / 1024
 
-    download_line = TextContent(
-        type="text",
-        text=f"⬇️ [Download {att.filename} ({size_kb:.1f} KB)]({url})",
-    )
-
-    if mime_type in INLINE_IMAGE_MIME_TYPES and size_bytes <= MAX_INLINE_IMAGE_BYTES:
-        image_block = ImageContent(
-            type="image",
-            data=base64.b64encode(att.content).decode("utf-8"),
-            mimeType=att.mime_type,
-        )
-        return [image_block, download_line]
-
+    # IMPORTANT: send actual image bytes as MCP ImageContent.
+    # This is what allows Claude to visually inspect the attachment instead
+    # of only seeing a markdown URL.
     if mime_type.startswith("image/"):
-        # SVG or an oversized raster image: no reliable inline render,
-        # link only.
-        label = "🖼️"
-    elif "pdf" in mime_type:
-        label = "📄"
-    else:
-        label = "📎"
+        encoded = base64.b64encode(att.content).decode("ascii")
+
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Image attachment: {att.filename}\n"
+                    f"Type: {att.mime_type or 'unknown'}\n"
+                    f"Size: {size_kb:.1f} KB\n"
+                    "The next MCP content block contains the original image. "
+                    "You can inspect it visually."
+                ),
+            ),
+            ImageContent(
+                type="image",
+                data=encoded,
+                mimeType=mime_type,
+            ),
+        ]
+
+    # Documents are not sent as image content. Claude can call
+    # extract_attachment_text() for PDF/DOCX/XLSX/PPTX/TXT/RTF content.
+    url = attachment_download_url(att)
+    label = "📄" if "pdf" in mime_type else "📎"
 
     return [
         TextContent(
             type="text",
-            text=f"{label} {att.filename} ({size_kb:.1f} KB, "
-                 f"{att.mime_type or 'unknown type'})",
-        ),
-        download_line,
+            text=(
+                f"{label} {att.filename}\n"
+                f"Type: {att.mime_type or 'unknown'}\n"
+                f"Size: {size_kb:.1f} KB\n"
+                f"Download: {url}\n"
+                "For supported documents, call extract_attachment_text() "
+                "to read the attachment contents."
+            ),
+        )
     ]
 
 
@@ -337,11 +324,12 @@ def list_attachments(email_id: int) -> list[dict]:
 @mcp.tool(structured_output=False)
 def get_attachment_content(attachment_id: int, include_link: bool = True):
     """
-    Retrieve one attachment so Claude can actually display/download it.
+    Retrieve one attachment for Claude.
 
-    Images render inline (real MCP image content, not just a link).
-    PDFs and any other file type (docx, xlsx, zip, ...) get an explicit
-    download link.
+    Images are returned as real MCP ImageContent using the original bytes
+    stored in PostgreSQL, so Claude can visually inspect them. PDFs and
+    other documents are exposed with metadata/download information; use
+    extract_attachment_text() to read supported document contents.
 
     Args:
         attachment_id: Internal attachment ID (from list_attachments)
@@ -565,39 +553,5 @@ def search_emails_with_attachments(
             emails = emails[:limit]
         
         return [serialize(e) for e in emails]
-    finally:
-        db.close()
-
-
-@mcp.tool()
-def sync_missing_attachments(limit: int | None = None) -> dict:
-    """
-    Downloads the actual attachment bytes for emails already stored in
-    the database whose metadata says they have attachments but whose
-    content was never downloaded (stored_attachments_count is less than
-    the number of attachments listed) — e.g. emails synced before
-    attachment downloading was fully wired up.
-
-    Call this when list_emails / search results show attachments in
-    metadata but get_attachment_content / get_email_with_attachments
-    can't display or download them (has_content: false, or
-    stored_attachments_count 0 while attachments is non-empty).
-
-    Args:
-        limit: Max number of such emails to backfill in this call. Omit
-               to attempt all of them (may take a while on a large
-               backlog — call again with a limit if it times out).
-
-    Returns:
-        {
-            "emails_checked": int,
-            "emails_backfilled": list[int],
-            "attachments_stored": int,
-            "attachments_failed": int,
-        }
-    """
-    db = SessionLocal()
-    try:
-        return backfill_missing_attachments(db, limit=limit)
     finally:
         db.close()

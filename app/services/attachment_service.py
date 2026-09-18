@@ -85,7 +85,7 @@ def download_and_store_attachment(
         )
         
         db.add(attachment)
-        db.commit()
+        # The caller owns the transaction. Do not commit here.
         
         logger.info(
             f"Stored attachment {filename} ({len(content)} bytes) "
@@ -99,7 +99,7 @@ def download_and_store_attachment(
             f"Failed to download attachment {gmail_attachment_id} "
             f"for message {gmail_message_id}: {str(e)}"
         )
-        db.rollback()
+        # Do not rollback the caller's transaction here.
         return None
 
 
