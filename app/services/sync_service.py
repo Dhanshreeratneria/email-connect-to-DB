@@ -1,21 +1,24 @@
-"""
-Updated sync service with robust attachment downloading and storage.
-
-Key improvements:
-- Automatic attachment downloading during email sync
-- Retry logic for failed downloads
-- Progress tracking
-- Proper error handling
-"""
+from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional, Tuple
+
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.email import Email, EmailAttachment, EmailDelivery, GmailAccount
-from app.services.email_parser import decode_base64_urlsafe_bytes, parse_message
+from app.models.email import (
+    Email,
+    EmailAttachment,
+    EmailDelivery,
+    GmailAccount,
+)
+from app.services.email_parser import (
+    decode_base64_urlsafe_bytes,
+    parse_message,
+)
 from app.services.gmail_service import (
     get_attachment,
     get_message,
@@ -27,448 +30,992 @@ from app.services.gmail_service import (
 
 logger = logging.getLogger(__name__)
 
-# Small delay between individual Gmail API calls purely to stay under
-# Google's per-second rate limits.
-API_CALL_DELAY = 0.1  # 100ms delay between API calls to avoid rate limits
 
-# Maximum retries for failed attachment downloads
-MAX_ATTACHMENT_RETRIES = 3
+# ============================================================
+# ATTACHMENT STORAGE
+# ============================================================
 
 
 def store_attachments(
     db: Session,
     email: Email,
-    gmail_service,
+    gmail_service: Any,
     gmail_message_id: str,
-    attachments_meta: list[dict],
+    attachments_meta: list[dict[str, Any]],
 ) -> Tuple[int, int]:
     """
-    Downloads and stores the actual bytes for any attachment listed in
-    Email.attachments (parsed metadata) that isn't already saved in the
-    email_attachments table, so PDFs/zips/images/etc. end up persisted
-    in the database rather than just their filename/size/mime_type.
+    Download Gmail attachments and store their binary content
+    in PostgreSQL email_attachments.content.
 
-    Safe to call every time an already-stored email is seen again
-    (e.g. the same email delivered to a second connected account) —
-    existing (email_id, gmail_attachment_id) rows are skipped.
-    
-    Args:
-        db: SQLAlchemy session
-        email: Email object
-        gmail_service: Gmail API service
-        gmail_message_id: Gmail message ID
-        attachments_meta: List of attachment metadata dicts
-        
     Returns:
-        Tuple of (successful_downloads, failed_downloads)
+        (successful_count, failed_count)
+
+    Important:
+        - Existing attachments with content are skipped.
+        - Existing attachments with NULL content are retried.
+        - Duplicate attachment inserts use a SAVEPOINT so that
+          one duplicate cannot rollback the whole transaction.
     """
-    
+
     successful = 0
     failed = 0
+
+    if not attachments_meta:
+        return successful, failed
 
     for meta in attachments_meta:
         attachment_id = meta.get("attachment_id")
 
         if not attachment_id:
+            logger.warning(
+                "Skipping attachment without attachment_id for email %s",
+                email.id,
+            )
+            failed += 1
             continue
 
-        # Check if already stored
-        already_stored = db.scalar(
-            select(EmailAttachment).where(
-                EmailAttachment.email_id == email.id,
-                EmailAttachment.gmail_attachment_id == attachment_id,
+        filename = meta.get("filename") or "unknown"
+        mime_type = meta.get("mime_type")
+        size = meta.get("size")
+
+        try:
+            # ------------------------------------------------
+            # Check whether attachment already exists
+            # ------------------------------------------------
+            existing = db.scalar(
+                select(EmailAttachment).where(
+                    EmailAttachment.email_id == email.id,
+                    EmailAttachment.gmail_attachment_id == attachment_id,
+                )
             )
+
+            # Already downloaded successfully.
+            if existing is not None and existing.content is not None:
+                logger.info(
+                    "Attachment already stored: %s for email %s",
+                    filename,
+                    email.id,
+                )
+                successful += 1
+                continue
+
+            # ------------------------------------------------
+            # Download attachment from Gmail
+            # ------------------------------------------------
+            raw = get_attachment(
+                gmail_service,
+                gmail_message_id,
+                attachment_id,
+            )
+
+            if not raw:
+                raise ValueError(
+                    f"Gmail returned no attachment data for {filename}"
+                )
+
+            encoded_data = raw.get("data")
+
+            if not encoded_data:
+                raise ValueError(
+                    f"Gmail attachment response contains no data: {filename}"
+                )
+
+            content = decode_base64_urlsafe_bytes(encoded_data)
+
+            if not content:
+                raise ValueError(
+                    f"Decoded attachment is empty: {filename}"
+                )
+
+            # ------------------------------------------------
+            # Existing row but content was NULL -> retry/update
+            # ------------------------------------------------
+            if existing is not None:
+                existing.filename = filename
+                existing.mime_type = mime_type
+                existing.size = size
+                existing.content = content
+
+                db.flush()
+
+                logger.info(
+                    "Retried attachment %s (%d bytes) for email %s",
+                    filename,
+                    len(content),
+                    email.id,
+                )
+
+                successful += 1
+                continue
+
+            # ------------------------------------------------
+            # Create new attachment row
+            # ------------------------------------------------
+            attachment = EmailAttachment(
+                email_id=email.id,
+                gmail_attachment_id=attachment_id,
+                filename=filename,
+                mime_type=mime_type,
+                size=size,
+                content=content,
+            )
+
+            # SAVEPOINT:
+            # If another Pub/Sub worker inserts the same attachment
+            # at the same time, only this INSERT is rolled back.
+            try:
+                with db.begin_nested():
+                    db.add(attachment)
+                    db.flush()
+
+                logger.info(
+                    "Stored attachment %s (%d bytes) for email %s",
+                    filename,
+                    len(content),
+                    email.id,
+                )
+
+                successful += 1
+
+            except IntegrityError:
+                # Another worker probably inserted it first.
+                existing_after_race = db.scalar(
+                    select(EmailAttachment).where(
+                        EmailAttachment.email_id == email.id,
+                        EmailAttachment.gmail_attachment_id == attachment_id,
+                    )
+                )
+
+                if (
+                    existing_after_race is not None
+                    and existing_after_race.content is not None
+                ):
+                    logger.info(
+                        "Attachment already stored by another sync: %s "
+                        "for email %s",
+                        filename,
+                        email.id,
+                    )
+                    successful += 1
+                else:
+                    raise
+
+        except Exception:
+            failed += 1
+
+            logger.exception(
+                "Failed to store attachment %s for email %s",
+                filename,
+                email.id,
+            )
+
+    return successful, failed
+
+
+# ============================================================
+# DELIVERY HELPERS
+# ============================================================
+
+
+def _get_existing_delivery(
+    db: Session,
+    account: GmailAccount,
+    gmail_message_id: str,
+) -> Optional[EmailDelivery]:
+    """
+    Find an already-recorded Gmail delivery.
+
+    This is the first idempotency check and prevents the same
+    Pub/Sub notification from creating another delivery.
+    """
+
+    return db.scalar(
+        select(EmailDelivery)
+        .where(
+            EmailDelivery.account_id == account.id,
+            EmailDelivery.gmail_message_id == gmail_message_id,
+        )
+        .limit(1)
+    )
+
+
+def _get_or_create_email(
+    db: Session,
+    parsed: dict[str, Any],
+) -> Email:
+    """
+    Get the canonical Email row using RFC Message-ID.
+
+    Email.rfc_message_id represents the real-world email and is
+    therefore different from Gmail's per-account message ID.
+    """
+
+    rfc_message_id = parsed.get("rfc_message_id")
+
+    # --------------------------------------------------------
+    # Existing email by RFC Message-ID
+    # --------------------------------------------------------
+    if rfc_message_id:
+        existing = db.scalar(
+            select(Email)
+            .where(Email.rfc_message_id == rfc_message_id)
+            .limit(1)
         )
 
-        if already_stored:
-            logger.debug(f"Attachment {attachment_id} already stored")
-            continue
+        if existing is not None:
+            return existing
 
-        # Try to download with retries
-        retries = 0
-        while retries < MAX_ATTACHMENT_RETRIES:
-            try:
-                time.sleep(API_CALL_DELAY)
-                raw = get_attachment(gmail_service, gmail_message_id, attachment_id)
-                content = decode_base64_urlsafe_bytes(raw.get("data", ""))
+    # --------------------------------------------------------
+    # No existing email -> create it
+    # --------------------------------------------------------
+    email = Email(**parsed)
 
-                # Store in database
-                db.add(
-                    EmailAttachment(
-                        email_id=email.id,
-                        gmail_attachment_id=attachment_id,
-                        filename=meta.get("filename") or "attachment",
-                        mime_type=meta.get("mime_type"),
-                        size=raw.get("size") or meta.get("size"),
-                        content=content,
-                    )
-                )
-                
-                logger.info(
-                    f"Stored attachment {meta.get('filename')} ({len(content)} bytes) "
-                    f"for email {email.id}"
-                )
-                
-                successful += 1
-                break
+    db.add(email)
 
-            except Exception as e:
-                retries += 1
-                logger.warning(
-                    f"Failed to download attachment {attachment_id} (attempt {retries}/{MAX_ATTACHMENT_RETRIES}): {str(e)}"
-                )
-                
-                if retries >= MAX_ATTACHMENT_RETRIES:
-                    logger.error(
-                        f"Failed to download attachment {attachment_id} for message {gmail_message_id} "
-                        f"after {MAX_ATTACHMENT_RETRIES} retries"
-                    )
-                    failed += 1
-                else:
-                    time.sleep(1)  # Wait before retry
-    
-    return successful, failed
+    try:
+        # Flush so email.id is available for EmailDelivery and
+        # EmailAttachment.
+        with db.begin_nested():
+            db.flush()
+
+        return email
+
+    except IntegrityError:
+        # Another concurrent sync may have inserted the same
+        # RFC Message-ID.
+        if rfc_message_id:
+            existing = db.scalar(
+                select(Email)
+                .where(Email.rfc_message_id == rfc_message_id)
+                .limit(1)
+            )
+
+            if existing is not None:
+                return existing
+
+        raise
+
+
+def _determine_delivery_type(
+    account: GmailAccount,
+    parsed: dict[str, Any],
+) -> str:
+    """
+    Determine whether the connected Gmail account received the
+    email as To, Cc or Bcc.
+    """
+
+    account_email = account.google_email.lower().strip()
+
+    to_addresses = {
+        str(value).lower().strip()
+        for value in parsed.get("to_addresses", [])
+        if value
+    }
+
+    cc_addresses = {
+        str(value).lower().strip()
+        for value in parsed.get("cc_addresses", [])
+        if value
+    }
+
+    if account_email in to_addresses:
+        return "to"
+
+    if account_email in cc_addresses:
+        return "cc"
+
+    return "bcc"
+
+
+def _merge_attachment_metadata(
+    email: Email,
+    parsed_attachments: list[dict[str, Any]],
+) -> None:
+    """
+    Keep Email.attachments JSON metadata synchronized with the
+    Gmail payload.
+
+    Actual binary content is stored separately in
+    EmailAttachment.content.
+    """
+
+    if not parsed_attachments:
+        return
+
+    existing_metadata = email.attachments or []
+
+    # Make a lookup by Gmail attachment ID.
+    existing_by_id = {
+        item.get("attachment_id"): item
+        for item in existing_metadata
+        if isinstance(item, dict) and item.get("attachment_id")
+    }
+
+    for item in parsed_attachments:
+        attachment_id = item.get("attachment_id")
+
+        if attachment_id:
+            existing_by_id[attachment_id] = item
+
+    email.attachments = list(existing_by_id.values())
+    email.has_attachments = len(email.attachments) > 0
 
 
 def record_email_delivery(
     db: Session,
     account: GmailAccount,
-    gmail_message: dict,
-    gmail_service=None,
-    attachment_stats: dict | None = None,
-) -> Email:
+    message: dict[str, Any],
+    gmail_service: Any,
+    attachment_stats: Optional[dict[str, int]] = None,
+) -> EmailDelivery:
     """
-    Store (or link to) an email exactly once by its RFC Message-ID header,
-    and record how THIS account received it (to / cc / bcc).
+    Process one Gmail message.
 
-    - If this exact account has already recorded this exact Gmail message
-      (same account_id + gmail_message_id), nothing changes: returns the
-      existing email untouched.
-    - If another connected account already stored this same real-world
-      email (matched by rfc_message_id), the email content is NOT
-      duplicated — only a new EmailDelivery row is added for this account.
-    - Otherwise, a brand-new Email row is created.
-    
-    NEW: Automatically downloads and stores attachment content during sync.
+    Flow:
+
+        Gmail message
+             ↓
+        parse_message()
+             ↓
+        find/create canonical Email
+             ↓
+        find/create EmailDelivery
+             ↓
+        download attachments
+             ↓
+        store attachment bytes in PostgreSQL
+
+    The function is idempotent and safe to call repeatedly for the
+    same Gmail message.
     """
 
-    gmail_message_id = gmail_message["id"]
+    gmail_message_id = message.get("id")
 
-    # Already recorded for this exact account? Nothing to do.
-    existing_delivery = db.scalar(
-        select(EmailDelivery).where(
-            EmailDelivery.account_id == account.id,
-            EmailDelivery.gmail_message_id == gmail_message_id,
-        )
+    if not gmail_message_id:
+        raise ValueError("Gmail message does not contain an id")
+
+    # --------------------------------------------------------
+    # STEP 1: Delivery already exists
+    # --------------------------------------------------------
+    existing_delivery = _get_existing_delivery(
+        db,
+        account,
+        gmail_message_id,
     )
 
-    if existing_delivery:
-        # The email may already exist while an earlier attachment download
-        # failed. Re-parse and retry missing attachments instead of returning
-        # immediately.
-        email = existing_delivery.email
-        parsed_existing = parse_message(gmail_message)
-        attachments_meta = parsed_existing.get("attachments") or []
-
-        if gmail_service is not None and attachments_meta:
-            successful, failed = store_attachments(
-                db=db,
-                email=email,
-                gmail_service=gmail_service,
-                gmail_message_id=gmail_message_id,
-                attachments_meta=attachments_meta,
-            )
-            if attachment_stats is not None:
-                attachment_stats["successful"] = attachment_stats.get("successful", 0) + successful
-                attachment_stats["failed"] = attachment_stats.get("failed", 0) + failed
-
-            if successful or failed:
-                logger.info(
-                    f"Attachment retry for email {email.id}: "
-                    f"{successful} stored, {failed} failed"
-                )
-
-        return email
-
-    parsed = parse_message(gmail_message)
-
-    # Extra fields used only for delivery-type detection; not DB columns.
-    to_addresses = parsed.pop("to_addresses")
-    cc_addresses = parsed.pop("cc_addresses")
-
-    account_email = account.google_email.lower()
-
-    if account_email in to_addresses:
-        delivery_type = "to"
-    elif account_email in cc_addresses:
-        delivery_type = "cc"
-    else:
-        delivery_type = "bcc"
-
-    rfc_message_id = parsed.get("rfc_message_id")
-    email = None
-
-    if rfc_message_id:
-        email = db.scalar(
-            select(Email).where(Email.rfc_message_id == rfc_message_id)
+    if existing_delivery is not None:
+        logger.info(
+            "Delivery already exists for Gmail message %s "
+            "(email_id=%s). Retrying/checking attachments.",
+            gmail_message_id,
+            existing_delivery.email_id,
         )
 
-    if email is None:
-        email = Email(**parsed)
-        db.add(email)
-        db.flush()  # populate email.id before creating delivery row
+        email = existing_delivery.email
 
-    # UPDATED: Download and store attachments
-    if gmail_service is not None and parsed.get("attachments"):
+        # If relationship is not loaded, fetch it explicitly.
+        if email is None:
+            email = db.get(Email, existing_delivery.email_id)
+
+        if email is None:
+            raise RuntimeError(
+                f"Delivery {existing_delivery.id} points to missing "
+                f"email {existing_delivery.email_id}"
+            )
+
+        parsed = parse_message(message)
+
+        attachments_meta = parsed.get("attachments") or []
+
         successful, failed = store_attachments(
             db=db,
             email=email,
             gmail_service=gmail_service,
             gmail_message_id=gmail_message_id,
-            attachments_meta=parsed["attachments"],
+            attachments_meta=attachments_meta,
         )
-        
-        if attachment_stats is not None:
-            attachment_stats["successful"] = attachment_stats.get("successful", 0) + successful
-            attachment_stats["failed"] = attachment_stats.get("failed", 0) + failed
 
-        if successful > 0 or failed > 0:
-            logger.info(
-                f"Attachment sync for email {email.id}: "
-                f"{successful} stored, {failed} failed"
-            )
+        if attachment_stats is not None:
+            attachment_stats["successful"] += successful
+            attachment_stats["failed"] += failed
+
+        return existing_delivery
+
+    # --------------------------------------------------------
+    # STEP 2: Parse Gmail message
+    # --------------------------------------------------------
+    parsed = parse_message(message)
+
+    # These are helper fields and are NOT columns in Email.
+    to_addresses = parsed.pop("to_addresses", [])
+    cc_addresses = parsed.pop("cc_addresses", [])
+
+    attachments_meta = parsed.get("attachments") or []
+
+    # --------------------------------------------------------
+    # STEP 3: Get/create canonical Email
+    # --------------------------------------------------------
+    email = _get_or_create_email(
+        db,
+        parsed,
+    )
+
+    # Keep JSON attachment metadata updated.
+    _merge_attachment_metadata(
+        email,
+        attachments_meta,
+    )
+
+    # --------------------------------------------------------
+    # STEP 4: Determine To/Cc/Bcc
+    # --------------------------------------------------------
+    delivery_type = _determine_delivery_type(
+        account,
+        {
+            "to_addresses": to_addresses,
+            "cc_addresses": cc_addresses,
+        },
+    )
+
+    # --------------------------------------------------------
+    # STEP 5: Create delivery
+    # --------------------------------------------------------
+    received_at = email.received_at or datetime.now(timezone.utc)
 
     delivery = EmailDelivery(
         email_id=email.id,
         account_id=account.id,
         gmail_message_id=gmail_message_id,
         delivery_type=delivery_type,
-        received_at=parsed["received_at"],
+        received_at=received_at,
     )
-    db.add(delivery)
 
-    return email
+    try:
+        # SAVEPOINT prevents a duplicate delivery from rolling
+        # back the Email/attachment transaction.
+        with db.begin_nested():
+            db.add(delivery)
+            db.flush()
+
+        logger.info(
+            "Recorded email delivery: gmail_message_id=%s "
+            "email_id=%s account_id=%s type=%s",
+            gmail_message_id,
+            email.id,
+            account.id,
+            delivery_type,
+        )
+
+    except IntegrityError:
+        # Another Pub/Sub worker inserted the delivery first.
+        existing_delivery = _get_existing_delivery(
+            db,
+            account,
+            gmail_message_id,
+        )
+
+        if existing_delivery is None:
+            raise
+
+        logger.info(
+            "Duplicate delivery detected for Gmail message %s; "
+            "using existing delivery id=%s",
+            gmail_message_id,
+            existing_delivery.id,
+        )
+
+        # Use the canonical email referenced by the winning delivery.
+        canonical_email = db.get(
+            Email,
+            existing_delivery.email_id,
+        )
+
+        if canonical_email is None:
+            raise RuntimeError(
+                f"Existing delivery {existing_delivery.id} references "
+                f"missing email {existing_delivery.email_id}"
+            )
+
+        email = canonical_email
+        delivery = existing_delivery
+
+    # --------------------------------------------------------
+    # STEP 6: Store actual attachment bytes
+    # --------------------------------------------------------
+    successful, failed = store_attachments(
+        db=db,
+        email=email,
+        gmail_service=gmail_service,
+        gmail_message_id=gmail_message_id,
+        attachments_meta=attachments_meta,
+    )
+
+    if attachment_stats is not None:
+        attachment_stats["successful"] += successful
+        attachment_stats["failed"] += failed
+
+    logger.info(
+        "Attachment sync for email %s: %d stored, %d failed",
+        email.id,
+        successful,
+        failed,
+    )
+
+    return delivery
+
+
+# ============================================================
+# INITIAL SYNC
+# ============================================================
 
 
 def initial_sync(
     db: Session,
     account: GmailAccount,
-    gmail_service,
-) -> dict:
+    gmail_service: Any,
+    max_results: int = 100,
+) -> dict[str, Any]:
     """
-    Fetch the FULL mailbox message list and store every email
-    (rate-limited only by a small delay between calls, not by count).
+    Perform the first/full Gmail mailbox synchronization.
+    """
 
-    This runs after initial OAuth authorization or as recovery when a
-    stored Gmail History ID becomes invalid.
-    
-    Returns:
-        Dict with sync statistics:
-        {
-            "emails_imported": int,
-            "attachments_stored": int,
-            "attachment_failures": int,
-            "duration_seconds": float
-        }
-    """
-    
-    import time as time_module
-    start_time = time_module.time()
-    
-    imported_count = 0
-    total_attachments_stored = 0
-    total_attachment_failures = 0
-    page_token = None
+    logger.info(
+        "Starting initial sync for Gmail account %s",
+        account.google_email,
+    )
+
+    stats = {
+        "emails": 0,
+        "attachments_stored": 0,
+        "attachment_failures": 0,
+        "failures": 0,
+    }
 
     try:
-        while True:
-            logger.info(f"Fetching messages page (imported so far: {imported_count})...")
+        messages = list_messages(
+            gmail_service,
+            max_results=max_results,
+        )
 
-            response = list_messages(gmail_service, page_token)
-            messages = response.get("messages", [])
+        if not messages:
+            logger.info(
+                "Initial sync: no Gmail messages found for %s",
+                account.google_email,
+            )
 
-            if not messages:
-                logger.info("No more messages to fetch")
-                break
+            db.commit()
 
-            for item in messages:
-                try:
-                    # Small delay to avoid hitting Gmail API rate limits
-                    time.sleep(API_CALL_DELAY)
+            return stats
 
-                    message = get_message(gmail_service, item["id"])
-                    attachment_stats = {"successful": 0, "failed": 0}
-                    record_email_delivery(
-                        db, account, message, gmail_service, attachment_stats
-                    )
-                    total_attachments_stored += attachment_stats["successful"]
-                    total_attachment_failures += attachment_stats["failed"]
+        for message_item in messages:
+            gmail_message_id = (
+                message_item.get("id")
+                if isinstance(message_item, dict)
+                else None
+            )
 
-                    imported_count += 1
+            if not gmail_message_id:
+                continue
 
-                    if imported_count % 10 == 0:
-                        db.commit()
-                        logger.info(f"Progress: {imported_count} emails imported")
+            try:
+                # Fetch complete message payload.
+                message = get_message(
+                    gmail_service,
+                    gmail_message_id,
+                )
 
-                except Exception:
-                    logger.exception(
-                        f"Failed to process message {item.get('id')} during initial sync"
-                    )
+                attachment_stats = {
+                    "successful": 0,
+                    "failed": 0,
+                }
 
-            # Move to next page
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
+                record_email_delivery(
+                    db=db,
+                    account=account,
+                    message=message,
+                    gmail_service=gmail_service,
+                    attachment_stats=attachment_stats,
+                )
 
-        db.commit()
+                stats["emails"] += 1
+                stats["attachments_stored"] += attachment_stats["successful"]
+                stats["attachment_failures"] += attachment_stats["failed"]
 
-        elapsed = time_module.time() - start_time
+                # Commit each message so one bad message does not
+                # rollback successfully synchronized previous messages.
+                db.commit()
+
+            except Exception:
+                db.rollback()
+
+                stats["failures"] += 1
+
+                logger.exception(
+                    "Initial sync failed for Gmail message %s",
+                    gmail_message_id,
+                )
 
         logger.info(
-            f"Initial sync complete: {imported_count} emails, "
-            f"{total_attachments_stored} attachments stored, "
-            f"{total_attachment_failures} failures in {elapsed:.1f}s"
+            "Initial sync complete: %d emails, %d attachments stored, "
+            "%d attachment failures, %d message failures",
+            stats["emails"],
+            stats["attachments_stored"],
+            stats["attachment_failures"],
+            stats["failures"],
         )
-        
-        return {
-            "emails_imported": imported_count,
-            "attachments_stored": total_attachments_stored,
-            "attachment_failures": total_attachment_failures,
-            "duration_seconds": elapsed,
-        }
+
+        return stats
 
     except Exception:
-        logger.exception("Initial sync failed")
         db.rollback()
+
+        logger.exception(
+            "Initial sync failed for account %s",
+            account.google_email,
+        )
+
         raise
+
+
+# ============================================================
+# INCREMENTAL SYNC
+# ============================================================
 
 
 def incremental_sync(
     db: Session,
     account: GmailAccount,
-    gmail_service,
-) -> dict:
+    gmail_service: Any,
+    notification_history_id: Optional[str] = None,
+) -> dict[str, Any]:
     """
-    Fetch only new/modified emails since last sync using Gmail History API.
+    Process Gmail History API changes after the last known history ID.
 
-    Much faster than full re-import, but requires maintaining a valid
-    history_id in the account record.
-    
-    Returns:
-        Dict with sync statistics (same format as initial_sync)
+    This function is safe to run multiple times because:
+        - Email is deduplicated by RFC Message-ID.
+        - EmailDelivery is deduplicated by account + Gmail message ID.
+        - EmailAttachment is deduplicated by email + attachment ID.
     """
-    
-    import time as time_module
-    start_time = time_module.time()
-    
-    if not account.history_id:
+
+    logger.info(
+        "Starting incremental sync for account %s",
+        account.google_email,
+    )
+
+    stats = {
+        "emails": 0,
+        "attachments_stored": 0,
+        "attachment_failures": 0,
+        "failures": 0,
+    }
+
+    # --------------------------------------------------------
+    # Determine starting history ID
+    # --------------------------------------------------------
+    start_history_id = (
+        notification_history_id
+        or account.history_id
+    )
+
+    if not start_history_id:
         logger.warning(
-            f"No history_id for {account.google_email}, falling back to initial sync"
+            "No history_id available for account %s; "
+            "falling back to initial sync.",
+            account.google_email,
         )
-        return initial_sync(db, account, gmail_service)
 
-    imported_count = 0
-    total_attachments_stored = 0
-    total_attachment_failures = 0
-    page_token = None
-    start_history_id = account.history_id
+        return initial_sync(
+            db=db,
+            account=account,
+            gmail_service=gmail_service,
+        )
 
     try:
-        while True:
-            logger.info(f"Fetching history page (processed: {imported_count})...")
+        history_response = history(
+            gmail_service,
+            start_history_id,
+        )
 
-            response = history(gmail_service, start_history_id, page_token)
-            histories = response.get("history", [])
+        if not history_response:
+            logger.info(
+                "No history response for account %s",
+                account.google_email,
+            )
 
-            if not histories:
-                logger.info("No new history to process")
-                break
+            db.commit()
+            return stats
 
-            for hist in histories:
-                messages_added = hist.get("messagesAdded", [])
+        # ----------------------------------------------------
+        # Gmail History API response
+        # ----------------------------------------------------
+        history_items = history_response.get("history") or []
 
-                for item in messages_added:
-                    try:
-                        time.sleep(API_CALL_DELAY)
-                        message = get_message(gmail_service, item["message"]["id"])
-                        attachment_stats = {"successful": 0, "failed": 0}
-                        record_email_delivery(
-                            db, account, message, gmail_service, attachment_stats
-                        )
-                        total_attachments_stored += attachment_stats["successful"]
-                        total_attachment_failures += attachment_stats["failed"]
+        # Gmail returns a new historyId in the response.
+        new_history_id = history_response.get("historyId")
 
-                        imported_count += 1
+        processed_message_ids: set[str] = set()
 
-                        if imported_count % 10 == 0:
-                            db.commit()
-                            logger.info(f"Progress: {imported_count} emails synced")
+        # ----------------------------------------------------
+        # Collect message IDs
+        # ----------------------------------------------------
+        for history_item in history_items:
 
-                    except Exception:
-                        logger.exception(
-                            f"Failed to process message {item['message'].get('id')} "
-                            f"during incremental sync"
-                        )
+            # messagesAdded
+            for added in history_item.get("messagesAdded", []) or []:
+                message_info = added.get("message") or {}
 
-            # Update history ID
-            new_history_id = response.get("historyId")
-            if new_history_id:
-                account.history_id = new_history_id
+                message_id = message_info.get("id")
 
-            page_token = response.get("nextPageToken")
-            if not page_token:
-                break
+                if message_id:
+                    processed_message_ids.add(message_id)
 
-        db.commit()
+            # Some Gmail responses may expose messages directly.
+            for message_info in history_item.get("messages", []) or []:
+                message_id = message_info.get("id")
 
-        elapsed = time_module.time() - start_time
+                if message_id:
+                    processed_message_ids.add(message_id)
 
         logger.info(
-            f"Incremental sync complete: {imported_count} emails, "
-            f"{total_attachments_stored} attachments stored, "
-            f"{total_attachment_failures} failures in {elapsed:.1f}s"
+            "Incremental sync found %d Gmail messages",
+            len(processed_message_ids),
         )
-        
-        return {
-            "emails_imported": imported_count,
-            "attachments_stored": total_attachments_stored,
-            "attachment_failures": total_attachment_failures,
-            "duration_seconds": elapsed,
-        }
+
+        # ----------------------------------------------------
+        # Process each message
+        # ----------------------------------------------------
+        for gmail_message_id in processed_message_ids:
+
+            try:
+                message = get_message(
+                    gmail_service,
+                    gmail_message_id,
+                )
+
+                attachment_stats = {
+                    "successful": 0,
+                    "failed": 0,
+                }
+
+                record_email_delivery(
+                    db=db,
+                    account=account,
+                    message=message,
+                    gmail_service=gmail_service,
+                    attachment_stats=attachment_stats,
+                )
+
+                stats["emails"] += 1
+                stats["attachments_stored"] += attachment_stats["successful"]
+                stats["attachment_failures"] += attachment_stats["failed"]
+
+                # Commit successful message immediately.
+                db.commit()
+
+            except Exception:
+                db.rollback()
+
+                stats["failures"] += 1
+
+                logger.exception(
+                    "Incremental sync failed for Gmail message %s",
+                    gmail_message_id,
+                )
+
+        # ----------------------------------------------------
+        # Update Gmail history cursor
+        # ----------------------------------------------------
+        if new_history_id:
+            account.history_id = str(new_history_id)
+            db.commit()
+
+        logger.info(
+            "Incremental sync complete: %d emails, %d attachments stored, "
+            "%d attachment failures, %d message failures",
+            stats["emails"],
+            stats["attachments_stored"],
+            stats["attachment_failures"],
+            stats["failures"],
+        )
+
+        return stats
 
     except Exception:
-        logger.exception("Incremental sync failed")
         db.rollback()
+
+        logger.exception(
+            "Incremental sync failed for account %s",
+            account.google_email,
+        )
+
         raise
 
 
-def watch_mailbox(db: Session, account: GmailAccount, gmail_service, pubsub_topic: str) -> None:
+# ============================================================
+# WATCH / PUBSUB
+# ============================================================
+
+
+def watch_mailbox(
+    db: Session,
+    account: GmailAccount,
+    gmail_service: Any,
+) -> dict[str, Any]:
     """
-    Set up Gmail push notifications to detect new messages immediately.
-    
-    Keeps watching until the watch expires (typically 24 hours).
-    After expiration, the watch needs to be renewed.
+    Register Gmail push notifications through Google Pub/Sub.
     """
-    try:
-        logger.info(f"Setting up Gmail watch for {account.google_email}...")
-        
-        response = watch(gmail_service, pubsub_topic)
-        
-        if "expiration" in response:
-            from datetime import datetime, timezone
-            expiration_ms = int(response["expiration"])
-            expiration = datetime.fromtimestamp(
-                expiration_ms / 1000,
-                tz=timezone.utc
+
+    logger.info(
+        "Starting Gmail watch for account %s",
+        account.google_email,
+    )
+
+    result = watch(
+        gmail_service,
+    )
+
+    if not result:
+        raise RuntimeError(
+            "Gmail watch() returned an empty response"
+        )
+
+    history_id = result.get("historyId")
+    expiration = result.get("expiration")
+
+    if history_id:
+        account.history_id = str(history_id)
+
+    if expiration:
+        try:
+            # Gmail expiration is milliseconds since epoch.
+            account.watch_expiration = datetime.fromtimestamp(
+                int(expiration) / 1000,
+                tz=timezone.utc,
             )
-            account.watch_expiration = expiration
-            
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "Could not parse Gmail watch expiration: %s",
+                expiration,
+            )
+
+    db.commit()
+
+    logger.info(
+        "Gmail watch registered for %s: history_id=%s expiration=%s",
+        account.google_email,
+        history_id,
+        expiration,
+    )
+
+    return result
+
+
+# ============================================================
+# RETRY ATTACHMENTS
+# ============================================================
+
+
+def retry_missing_attachments(
+    db: Session,
+    account: GmailAccount,
+    gmail_service: Any,
+    limit: int = 100,
+) -> dict[str, int]:
+    """
+    Retry attachments that have metadata but whose binary content
+    has not yet been stored in PostgreSQL.
+
+    Useful when:
+        - Gmail API temporarily failed
+        - Pub/Sub workers overlapped
+        - attachment download failed
+        - previous transaction was rolled back
+    """
+
+    stats = {
+        "emails": 0,
+        "attachments_stored": 0,
+        "failures": 0,
+    }
+
+    rows = db.execute(
+        select(
+            EmailAttachment,
+            EmailDelivery,
+        )
+        .join(
+            Email,
+            Email.id == EmailAttachment.email_id,
+        )
+        .join(
+            EmailDelivery,
+            EmailDelivery.email_id == Email.id,
+        )
+        .where(
+            EmailDelivery.account_id == account.id,
+            EmailAttachment.content.is_(None),
+        )
+        .limit(limit)
+    ).all()
+
+    logger.info(
+        "Attachment retry found %d missing attachments",
+        len(rows),
+    )
+
+    for attachment, delivery in rows:
+        try:
+            raw = get_attachment(
+                gmail_service,
+                delivery.gmail_message_id,
+                attachment.gmail_attachment_id,
+            )
+
+            if not raw or not raw.get("data"):
+                raise ValueError(
+                    f"No data returned for attachment {attachment.filename}"
+                )
+
+            content = decode_base64_urlsafe_bytes(
+                raw["data"]
+            )
+
+            if not content:
+                raise ValueError(
+                    f"Decoded content is empty for {attachment.filename}"
+                )
+
+            attachment.content = content
+
+            db.commit()
+
+            stats["emails"] += 1
+            stats["attachments_stored"] += 1
+
             logger.info(
-                f"Gmail watch set up successfully, expires at {expiration.isoformat()}"
+                "Attachment retry successful: %s (%d bytes) "
+                "for email %s",
+                attachment.filename,
+                len(content),
+                attachment.email_id,
             )
-        
-        db.commit()
 
-    except Exception:
-        logger.exception("Failed to set up Gmail watch")
-        raise
+        except Exception:
+            db.rollback()
+
+            stats["failures"] += 1
+
+            logger.exception(
+                "Attachment retry failed: %s for email %s",
+                attachment.filename,
+                attachment.email_id,
+            )
+
+    logger.info(
+        "Attachment retry complete: %d stored, %d failures",
+        stats["attachments_stored"],
+        stats["failures"],
+    )
+
+    return stats
