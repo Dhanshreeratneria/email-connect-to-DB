@@ -161,24 +161,30 @@ def attachment_to_content_blocks(attachment):
 
     if mime_type.startswith("image/"):
         encoded = base64.b64encode(attachment.content).decode("utf-8")
+        download_url = attachment_download_url(attachment.id)
 
         return [
             TextContent(
                 type="text",
-                text=f"Image: {attachment.filename}"
+                text=(
+                    f"Image: {attachment.filename}\n"
+                    f"Download: {download_url}"
+                )
             ),
             ImageContent(
                 type="image",
                 data=encoded,
-                mime_type=mime_type,
+                mimeType=mime_type,   # ✅ fixed: camelCase, matches ImageContent schema
             ),
         ]
 
+    download_url = attachment_download_url(attachment.id)
     return [
         TextContent(
             type="text",
             text=f"Attachment: {attachment.filename}\n"
-                 f"MIME type: {mime_type}"
+                 f"MIME type: {mime_type}\n"
+                 f"Download: {download_url}"
         )
     ]
 def attachment_type_condition(
