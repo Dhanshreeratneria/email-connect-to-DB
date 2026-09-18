@@ -194,3 +194,21 @@ Add the production callback URL to Google OAuth client authorized redirect URIs,
 - Limit MCP results and enforce user/tenant authorization before returning email content.
 - Add PostgreSQL full-text search or `pg_trgm` indexes for large mailboxes; basic `ILIKE` is included for clarity.
 - This repository is a runnable foundation, but deployment-level auth, monitoring, backup, rate-limit, and scheduler configuration remain mandatory production operations.
+
+## Attachment support
+
+Attachments are stored as binary content in PostgreSQL (`email_attachments.content`).
+
+- Images: returned to MCP as native `ImageContent`.
+- PDFs: first 5 pages are rendered to PNG `ImageContent` blocks for visual inspection, and PDF text is extracted when available.
+- DOCX/XLSX/PPTX/CSV/TXT/RTF: readable text extraction is available.
+- All stored attachments have browser `download` and `view` URLs.
+- Download endpoint: `GET /api/attachments/{attachment_id}/download`
+- Inline view endpoint: `GET /api/attachments/{attachment_id}/view`
+- Backfill missing binaries: `POST /api/attachments/backfill`
+
+The MCP exposes 8 core tools:
+`search_emails`, `get_email`, `list_emails`, `get_thread`,
+`search_emails_with_attachments`, `list_attachments`,
+`get_attachment_content`, `extract_attachment_text`.
+

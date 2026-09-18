@@ -1,4 +1,4 @@
-﻿from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 import logging
 
 from fastapi import FastAPI, Request, Depends
@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
+from app.api.attachments import router as attachments_router
 from app.config import settings
 from app.database import get_db
 from app.mcp.server import mcp
@@ -51,6 +52,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
+app.include_router(attachments_router)
 
 # Configure MCP server
 logger.info("Configuring MCP server")
@@ -170,14 +172,10 @@ def mcp_info():
                 "get_email",
                 "list_emails",
                 "get_thread",
-                "search_by_sender",
-                "search_by_subject",
-                "search_by_date",
+                "search_emails_with_attachments",
                 "list_attachments",
                 "get_attachment_content",
                 "extract_attachment_text",
-                "get_email_with_attachments",
-                "search_emails_with_attachments",
             ]
         },
     }

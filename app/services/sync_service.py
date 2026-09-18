@@ -861,6 +861,7 @@ def watch_mailbox(
     db: Session,
     account: GmailAccount,
     gmail_service: Any,
+    pubsub_topic: str,
 ) -> dict[str, Any]:
     """
     Register Gmail push notifications through Google Pub/Sub.
@@ -873,6 +874,7 @@ def watch_mailbox(
 
     result = watch(
         gmail_service,
+        pubsub_topic,
     )
 
     if not result:
