@@ -312,44 +312,24 @@ def search_emails_with_attachments(
 ) -> list[dict[str, Any]]:
     """
     Search emails that have attachments.
-
-    attachment_type:
-      - any
-      - image
-      - pdf
-      - document
-      - spreadsheet
-      - archive
-
-    This checks the actual EmailAttachment table,
-    meaning the attachment has been stored in PostgreSQL.
     """
 
     limit = max(1, min(limit, 100))
     query = (query or "").strip()
-    attachment_type = (
-        attachment_type or "any"
-    ).lower().strip()
+    attachment_type = (attachment_type or "any").lower().strip()
 
     with SessionLocal() as database:
 
-        stmt = (
-            select(Email)
-            .join(
-                EmailAttachment,
-                EmailAttachment.email_id == Email.id,
-            )
+        # Step 1: find matching email IDs only (Email.id is a plain
+        # integer column, so DISTINCT works fine here — no JSON involved).
+        id_stmt = (
+            select(Email.id)
+            .join(EmailAttachment, EmailAttachment.email_id == Email.id)
         )
 
-        # ----------------------------------------------------
-        # EMAIL SEARCH
-        # ----------------------------------------------------
-
         if query:
-
             pattern = f"%{query}%"
-
-            stmt = stmt.where(
+            id_stmt = id_stmt.where(
                 or_(
                     Email.subject.ilike(pattern),
                     Email.body_text.ilike(pattern),
@@ -361,40 +341,28 @@ def search_emails_with_attachments(
                 )
             )
 
-        # ----------------------------------------------------
-        # ATTACHMENT TYPE
-        # ----------------------------------------------------
-
         if attachment_type != "any":
-
-            condition = attachment_type_condition(
-                attachment_type
-            )
-
+            condition = attachment_type_condition(attachment_type)
             if condition is not None:
-                stmt = stmt.where(condition)
+                id_stmt = id_stmt.where(condition)
 
-        # ----------------------------------------------------
-        # DISTINCT EMAILS
-        # ----------------------------------------------------
+        email_ids = [row[0] for row in database.execute(id_stmt.distinct()).all()]
 
+        if not email_ids:
+            return []
+
+        # Step 2: fetch full Email rows (including the JSON columns) —
+        # no DISTINCT needed here, so the JSON columns are no problem.
         stmt = (
-            stmt
-            .distinct()
-            .order_by(
-                Email.received_at.desc()
-            )
+            select(Email)
+            .where(Email.id.in_(email_ids))
+            .order_by(Email.received_at.desc())
             .limit(limit)
         )
 
         emails = database.execute(stmt).scalars().all()
 
-        return [
-            serialize_email(email)
-            for email in emails
-        ]
-
-
+        return [serialize_email(email) for email in emails]
 # ============================================================
 # TOOL 6
 # LIST ATTACHMENTS
