@@ -149,36 +149,42 @@ def attachment_download_url(attachment_id: int) -> str:
 
 
 def attachment_to_content_blocks(attachment):
+    import mimetypes
+
     if not attachment.content:
         return [
-            TextContent(
-                type="text",
-                text=f"Attachment content is not stored: {attachment.filename}"
-            )
+            TextContent(type="text", text=f"Attachment content is not stored: {attachment.filename}")
         ]
 
-    mime_type = attachment.mime_type or "application/octet-stream"
+    mime_type = attachment.mime_type or ""
+
+    # Fallback for attachments already stored with a blank MIME type
+    # (from before Bug #1 was fixed) — guess from the filename instead.
+    if not mime_type:
+        guessed, _ = mimetypes.guess_type(attachment.filename or "")
+        mime_type = guessed or "application/octet-stream"
+
+    download_url = attachment_download_url(attachment.id)
 
     if mime_type.startswith("image/"):
         encoded = base64.b64encode(attachment.content).decode("utf-8")
-        download_url = attachment_download_url(attachment.id)
-
         return [
             TextContent(
                 type="text",
                 text=(
                     f"Image: {attachment.filename}\n"
+                    f"MIME type: {mime_type}\n"
+                    f"Size: {attachment.size} bytes\n"
                     f"Download: {download_url}"
                 )
             ),
             ImageContent(
                 type="image",
                 data=encoded,
-                mimeType=mime_type,   # ✅ fixed: camelCase, matches ImageContent schema
+                mimeType=mime_type,   # ✅ was "mime_type" — wrong ImageContent field
             ),
         ]
 
-    download_url = attachment_download_url(attachment.id)
     return [
         TextContent(
             type="text",
@@ -187,124 +193,6 @@ def attachment_to_content_blocks(attachment):
                  f"Download: {download_url}"
         )
     ]
-def attachment_type_condition(
-    attachment_type: str,
-):
-    """
-    Build SQL condition for attachment category.
-    """
-
-    attachment_type = attachment_type.lower().strip()
-
-    if attachment_type == "image":
-        return EmailAttachment.mime_type.ilike("image/%")
-
-    if attachment_type == "pdf":
-        return EmailAttachment.mime_type.ilike(
-            "application/pdf"
-        )
-
-    if attachment_type == "document":
-        return or_(
-            EmailAttachment.mime_type.ilike(
-                "application/msword%"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/vnd.openxmlformats-officedocument.wordprocessingml%"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "text/plain"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/rtf"
-            ),
-        )
-
-    if attachment_type == "spreadsheet":
-        return or_(
-            EmailAttachment.mime_type.ilike(
-                "text/csv"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/vnd.ms-excel%"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml%"
-            ),
-        )
-
-    if attachment_type == "archive":
-        return or_(
-            EmailAttachment.mime_type.ilike(
-                "application/zip"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/x-rar%"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/x-7z%"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/gzip"
-            ),
-            EmailAttachment.mime_type.ilike(
-                "application/x-tar"
-            ),
-        )
-
-    return None
-
-
-# ============================================================
-# TOOL 1
-# SEARCH EMAILS
-# ============================================================
-
-@mcp.tool()
-def search_emails(
-    query: str,
-    limit: int = 20,
-) -> list[dict[str, Any]]:
-    """
-    Search emails by sender, recipient, subject, body,
-    thread ID, or message ID.
-
-    Use this as the main email search tool.
-    """
-
-    limit = max(1, min(limit, 100))
-    query = (query or "").strip()
-
-    with SessionLocal() as database:
-
-        stmt = select(Email)
-
-        if query:
-            pattern = f"%{query}%"
-
-            stmt = stmt.where(
-                or_(
-                    Email.subject.ilike(pattern),
-                    Email.body_text.ilike(pattern),
-                    Email.sender_email.ilike(pattern),
-                    Email.sender_name.ilike(pattern),
-                    Email.thread_id.ilike(pattern),
-                    Email.rfc_message_id.ilike(pattern),
-                )
-            )
-
-        stmt = stmt.order_by(
-            Email.received_at.desc()
-        ).limit(limit)
-
-        emails = database.execute(stmt).scalars().all()
-
-        return [
-            serialize_email(email)
-            for email in emails
-        ]
-
-
 # ============================================================
 # TOOL 2
 # GET EMAIL
@@ -580,55 +468,33 @@ def get_attachment_content(attachment_id: int):
 # TOOL 8
 # EXTRACT ATTACHMENT TEXT
 # ============================================================
-
 @mcp.tool()
-def extract_attachment_text(
-    attachment_id: int,
-) -> dict[str, Any]:
-    """
-    Extract text from supported document attachments.
-
-    The actual extraction implementation should be provided
-    by the attachment service.
-    """
-
-    from app.services.attachment_service import (
-        extract_text_from_attachment,
-    )
+def extract_attachment_text(attachment_id: int) -> dict[str, Any]:
+    from app.services.attachment_service import extract_text_from_attachment
 
     with SessionLocal() as database:
-
-        attachment = database.get(
-            EmailAttachment,
-            attachment_id,
-        )
+        attachment = database.get(EmailAttachment, attachment_id)
 
         if not attachment:
-            return {
-                "error": (
-                    f"Attachment "
-                    f"{attachment_id} not found."
-                )
-            }
+            return {"error": f"Attachment {attachment_id} not found."}
 
         if not attachment.content:
             return {
-                "error": (
-                    "Attachment content is not "
-                    "stored in PostgreSQL."
-                ),
-                "attachment": serialize_attachment(
-                    attachment
-                ),
+                "error": "Attachment content is not stored in PostgreSQL.",
+                "attachment": serialize_attachment(attachment),
             }
 
         try:
+            text = extract_text_from_attachment(database, attachment_id)  # ✅ correct signature
 
-            text = extract_text_from_attachment(
-                filename=attachment.filename,
-                mime_type=attachment.mime_type,
-                content=attachment.content,
-            )
+            if text is None:
+                return {
+                    "attachment_id": attachment.id,
+                    "filename": attachment.filename,
+                    "mime_type": attachment.mime_type,
+                    "text": None,
+                    "note": "No text could be extracted (unsupported type or empty content).",
+                }
 
             return {
                 "attachment_id": attachment.id,
@@ -638,19 +504,8 @@ def extract_attachment_text(
             }
 
         except Exception as exc:
-
-            logger.exception(
-                "Attachment text extraction failed"
-            )
-
-            return {
-                "error": (
-                    "Failed to extract attachment text."
-                ),
-                "details": str(exc),
-                "attachment_id": attachment.id,
-                "filename": attachment.filename,
-            }
+            logger.exception("Attachment text extraction failed")
+            return {"error": str(exc)}
 
 
 # ============================================================
