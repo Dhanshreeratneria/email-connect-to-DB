@@ -277,7 +277,7 @@ def attachment_to_content_blocks(database, attachment):
             import fitz
 
             document = fitz.open(stream=attachment.content, filetype="pdf")
-            for page_number in range(min(5, document.page_count)):
+            for page_number in range(document.page_count):
                 page = document[page_number]
                 image = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                 blocks.append(
