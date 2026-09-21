@@ -1,12 +1,38 @@
-﻿from pydantic_settings import BaseSettings, SettingsConfigDict
+﻿from urllib.parse import urlparse
+
+from pydantic import model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
 class Settings(BaseSettings):
- model_config=SettingsConfigDict(env_file=".env",extra="ignore")
- app_name:str="Gmail Email MCP"; environment:str="development"; database_url:str
- public_base_url:str; google_client_secrets_file:str="credentials.json"; google_oauth_redirect_uri:str
- google_pubsub_topic:str; google_pubsub_audience:str; token_encryption_key:str; mcp_api_key:str; watch_renewal_days:int=6
- connector_allowed_email:str=""
- auth0_domain:str=""
- auth0_api_audience:str=""
- auth0_issuer:str=""
- auth0_client_id:str=""
+	model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+	app_name: str = "Gmail Email MCP"
+	environment: str = "development"
+	database_url: str
+	public_base_url: str
+	google_client_secrets_file: str = "credentials.json"
+	google_oauth_redirect_uri: str
+	google_pubsub_topic: str
+	google_pubsub_audience: str
+	token_encryption_key: str
+	mcp_api_key: str
+	watch_renewal_days: int = 6
+	connector_allowed_email: str = ""
+	auth0_domain: str = ""
+	auth0_api_audience: str = ""
+	auth0_issuer: str = ""
+	auth0_client_id: str = ""
+
+	@model_validator(mode="after")
+	def validate_production_database(self):
+		if self.environment.lower() in {"production", "prod"}:
+			hostname = urlparse(self.database_url).hostname
+			if hostname in {"localhost", "127.0.0.1", "::1"}:
+				raise ValueError(
+					"DATABASE_URL must point to the Render PostgreSQL database in production"
+				)
+		return self
+
+
 settings=Settings()

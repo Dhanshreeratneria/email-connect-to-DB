@@ -418,14 +418,17 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+
+    port = int(os.getenv("PORT", "8000"))
     
     logger.info("Starting Gmail Email MCP server")
-    logger.info(f"Listening on http://0.0.0.0:8000")
-    logger.info(f"API Docs: http://0.0.0.0:8000/docs")
+    logger.info(f"Listening on http://0.0.0.0:{port}")
+    logger.info(f"API Docs: http://0.0.0.0:{port}/docs")
     
     uvicorn.run(
         app,
         host="0.0.0.0",
-        port=8000,
+        port=port,
         log_level="info"
     )

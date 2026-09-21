@@ -75,6 +75,12 @@ On the web service → **Environment** tab, add each of these. Mark the sensitiv
 | `MCP_API_KEY` | any long random string, e.g. `python -c "import secrets;print(secrets.token_urlsafe(32))"` | secret — used to protect `/mcp` |
 | `WATCH_RENEWAL_DAYS` | `6` | matches `.env.example` default |
 
+The `DATABASE_URL` value must be copied from the Render PostgreSQL service's
+**Internal Database URL**. Do not copy the local `.env` value or use
+`localhost`; Render environment variables override `.env` when configured.
+After saving the variable, trigger a manual deploy and confirm the migration
+step no longer reports a localhost connection.
+
 `app/config.py` reads these via `pydantic-settings`, so the names must match exactly (case-insensitive) — `DATABASE_URL`, `PUBLIC_BASE_URL`, etc.
 
 ## 5. Get `credentials.json` onto the server
