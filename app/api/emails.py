@@ -152,6 +152,10 @@ async def get_email_attachments(
 
 
 @router.get(
+    "/api/attachments/{attachment_id}/download",
+    dependencies=[Depends(auth0.http_scope("download:attachments"))],
+)
+@router.get(
     "/attachments/{attachment_id}/download",
     dependencies=[Depends(auth0.http_scope("download:attachments"))],
 )

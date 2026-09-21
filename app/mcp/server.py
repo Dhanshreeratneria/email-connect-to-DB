@@ -242,6 +242,20 @@ def attachment_to_content_blocks(database, attachment):
 
     if mime_type.startswith("image/"):
         encoded = base64.b64encode(attachment.content).decode("utf-8")
+        image_content_args = {
+            "type": "image",
+            "data": encoded,
+        }
+        if "mime_type" in ImageContent.model_fields:
+            image_content = ImageContent(
+                **image_content_args,
+                mime_type=mime_type,
+            )
+        else:
+            image_content = ImageContent(
+                **image_content_args,
+                mimeType=mime_type,
+            )
         return [
             TextContent(
                 type="text",
@@ -252,11 +266,7 @@ def attachment_to_content_blocks(database, attachment):
                     f"View: {view_url}\nDownload: {download_url}"
                 )
             ),
-            ImageContent(
-                type="image",
-                data=encoded,
-                mimeType=mime_type,   # was "mime_type" — wrong ImageContent field
-            ),
+            image_content,
         ]
 
     if mime_type == "application/pdf":
