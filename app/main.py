@@ -41,6 +41,23 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+
+class NormalizeMcpPath:
+    """Accept both Claude's slash and no-slash MCP endpoint forms."""
+
+    def __init__(self, inner_app):
+        self.inner_app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            scope = dict(scope)
+            scope["path"] = "/mcp/"
+            scope["raw_path"] = b"/mcp/"
+        await self.inner_app(scope, receive, send)
+
+
+app.add_middleware(NormalizeMcpPath)
+
 # Configure CORS middleware
 app.add_middleware(
     CORSMiddleware,
