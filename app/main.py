@@ -14,9 +14,10 @@ from app.api.emails import router as emails_router
 from app.api.attachments import router as attachments_router
 from app.api.admin import router as admin_router
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.mcp.server import mcp
 from app.services import auth0, connector_auth
+from app.services import admin_auth
 from app.services.oauth_service import authorization_url
 
 # Configure logging
@@ -85,8 +86,9 @@ class RequireBearerToken:
         auth_header = headers.get(b"authorization", b"").decode()
         token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
         
-        # Verify token
-        token_data = auth0.safe_validate_token(token)
+        # Managed MCP tokens are database credentials, not Auth0 JWTs.
+        # Keep Auth0 and connector authentication unchanged for all other tokens.
+        token_data = _validate_mcp_bearer_token(token)
 
         if not token_data:
             base = settings.public_base_url.rstrip("/")
@@ -167,6 +169,14 @@ def _required_mcp_scope(body: bytes, headers: dict[bytes, bytes]) -> str | None:
     if tool_name in {"list_attachments", "get_attachment_content", "extract_attachment_text"}:
         return "read:attachments"
     return None
+
+
+def _validate_mcp_bearer_token(token: str | None) -> dict | None:
+    """Validate managed MCP tokens without logging or exposing the raw token."""
+    if token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
+        with SessionLocal() as database:
+            return admin_auth.validate_token(database, token)
+    return auth0.safe_validate_token(token)
 
 
 # Mount MCP endpoint with Bearer token protection
