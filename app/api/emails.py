@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.email import Email, EmailAttachment, EmailDelivery
 from app.schemas.email import AttachmentOut, EmailDeliveryOut, EmailOut
+from app.services import auth0
 
 router = APIRouter()
 
@@ -124,7 +125,9 @@ async def get_email_deliveries(
 
 
 @router.get(
-    "/emails/{message_id}/attachments", response_model=list[AttachmentOut]
+    "/emails/{message_id}/attachments",
+    response_model=list[AttachmentOut],
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
 )
 async def get_email_attachments(
     message_id: str,
@@ -148,7 +151,10 @@ async def get_email_attachments(
     return delivery.email.stored_attachments
 
 
-@router.get("/attachments/{attachment_id}/download")
+@router.get(
+    "/attachments/{attachment_id}/download",
+    dependencies=[Depends(auth0.http_scope("download:attachments"))],
+)
 async def download_attachment_by_id(
     attachment_id: int,
     db: Session = Depends(get_db),
@@ -180,7 +186,10 @@ async def download_attachment_by_id(
     )
 
 
-@router.get("/attachments/{attachment_id}/view")
+@router.get(
+    "/attachments/{attachment_id}/view",
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
+)
 async def view_attachment_by_id(
     attachment_id: int,
     db: Session = Depends(get_db),
@@ -201,7 +210,10 @@ async def view_attachment_by_id(
     )
 
 
-@router.get("/emails/{message_id}/attachments/{attachment_id}/download")
+@router.get(
+    "/emails/{message_id}/attachments/{attachment_id}/download",
+    dependencies=[Depends(auth0.http_scope("download:attachments"))],
+)
 async def download_email_attachment(
     message_id: str,
     attachment_id: int,

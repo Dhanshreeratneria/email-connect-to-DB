@@ -168,6 +168,28 @@ https://YOUR-DOMAIN/mcp
 4. Complete the connector authentication required by your gateway.
 5. Ask Claude, for example: “Find the latest email from Alice about the invoice and summarize the requested action.” Claude calls a read-only tool, receives matching PostgreSQL records, and answers from those records.
 
+### Auth0 authentication
+
+The `/mcp` resource accepts Auth0 RS256 access tokens. Configure these
+environment variables without committing secrets:
+
+```text
+AUTH0_DOMAIN=your-tenant.us.auth0.com
+AUTH0_API_AUDIENCE=https://email-connect-to-db.onrender.com
+AUTH0_ISSUER=https://your-tenant.us.auth0.com/
+AUTH0_CLIENT_ID=your-auth0-application-client-id
+```
+
+Auth0 must issue the following scopes:
+
+- `read:emails` for email search and retrieval tools
+- `read:attachments` for attachment viewing and text extraction
+- `download:attachments` for binary attachment downloads
+
+The protected-resource metadata is available at
+`/.well-known/oauth-protected-resource`, and the MCP URL remains
+`https://email-connect-to-db.onrender.com/mcp`.
+
 ## Render deployment
 
 Create a Render PostgreSQL database. Set `DATABASE_URL` to Render’s internal PostgreSQL URL. Deploy this repository as a Python Web Service:

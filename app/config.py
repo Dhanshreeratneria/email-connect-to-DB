@@ -4,5 +4,9 @@ class Settings(BaseSettings):
  app_name:str="Gmail Email MCP"; environment:str="development"; database_url:str
  public_base_url:str; google_client_secrets_file:str="credentials.json"; google_oauth_redirect_uri:str
  google_pubsub_topic:str; google_pubsub_audience:str; token_encryption_key:str; mcp_api_key:str; watch_renewal_days:int=6
- connector_allowed_email:str
+ connector_allowed_email:str=""
+ auth0_domain:str=""
+ auth0_api_audience:str=""
+ auth0_issuer:str=""
+ auth0_client_id:str=""
 settings=Settings()

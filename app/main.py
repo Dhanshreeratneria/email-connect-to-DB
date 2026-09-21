@@ -14,7 +14,7 @@ from app.api.attachments import router as attachments_router
 from app.config import settings
 from app.database import get_db
 from app.mcp.server import mcp
-from app.services import connector_auth
+from app.services import auth0, connector_auth
 from app.services.oauth_service import authorization_url
 
 # Configure logging
@@ -83,7 +83,7 @@ class RequireBearerToken:
         token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
         
         # Verify token
-        token_data = connector_auth.verify_access_token(token) if token else None
+        token_data = auth0.safe_validate_token(token)
 
         if not token_data:
             base = settings.public_base_url.rstrip("/")
@@ -100,10 +100,15 @@ class RequireBearerToken:
                     )
                 },
             )
+            response.headers.update(auth0.unauthorized_response_headers(base))
             await response(scope, receive, send)
             return
 
-        await self.inner_app(scope, receive, send)
+        claims_token = auth0.set_claims(token_data)
+        try:
+            await self.inner_app(scope, receive, send)
+        finally:
+            auth0.reset_claims(claims_token)
 
 
 # Mount MCP endpoint with Bearer token protection
@@ -180,7 +185,12 @@ def mcp_info():
                 "extract_attachment_text",
                 "get_email_with_attachments",
                 "search_emails_with_attachments",
-            ]
+            ],
+            "oauth_scopes": [
+                "read:emails",
+                "read:attachments",
+                "download:attachments",
+            ],
         },
     }
 
@@ -190,16 +200,16 @@ def mcp_info():
 @app.get("/.well-known/oauth-authorization-server")
 def authorization_server_metadata():
     """OAuth authorization server metadata endpoint"""
-    base = settings.public_base_url.rstrip("/")
+    issuer = settings.auth0_issuer.rstrip("/") + "/" if settings.auth0_issuer else ""
     return {
-        "issuer": base,
-        "authorization_endpoint": f"{base}/authorize",
-        "token_endpoint": f"{base}/token",
-        "registration_endpoint": f"{base}/register",
+        "issuer": issuer,
+        "authorization_endpoint": f"{issuer}authorize",
+        "token_endpoint": f"{issuer}oauth/token",
+        "jwks_uri": f"{issuer}.well-known/jwks.json",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["read:emails", "read:attachments", "download:attachments"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
     }
 
 
@@ -207,9 +217,12 @@ def authorization_server_metadata():
 def protected_resource_metadata():
     """Protected resource metadata endpoint"""
     base = settings.public_base_url.rstrip("/")
+    issuer = settings.auth0_issuer.rstrip("/") + "/" if settings.auth0_issuer else ""
     return {
         "resource": f"{base}/mcp",
-        "authorization_servers": [base]
+        "authorization_servers": [issuer] if issuer else [],
+        "scopes_supported": ["read:emails", "read:attachments", "download:attachments"],
+        "bearer_methods_supported": ["header"],
     }
 
 

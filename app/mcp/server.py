@@ -13,6 +13,7 @@ from mcp.types import ImageContent, TextContent
 from app.config import settings
 from app.database import SessionLocal
 from app.models.email import Email, EmailAttachment
+from app.services import auth0
 
 
 # ============================================================
@@ -332,6 +333,7 @@ def get_email(
     Get complete details of one email by database ID.
     """
 
+    auth0.require_scope("read:emails")
     with SessionLocal() as database:
 
         email = database.get(
@@ -361,6 +363,7 @@ def list_emails(
     List recent emails with pagination. Omit limit to return all emails.
     """
 
+    auth0.require_scope("read:emails")
     offset = max(0, offset)
 
     with SessionLocal() as database:
@@ -398,6 +401,7 @@ def get_thread(
     whole thread.
     """
 
+    auth0.require_scope("read:emails")
     thread_id = (thread_id or "").strip()
 
     if not thread_id:
@@ -440,6 +444,7 @@ def search_emails_with_attachments(
     Search emails that have attachments. Omit limit to return all matches.
     """
 
+    auth0.require_scope("read:emails")
     query = (query or "").strip()
     attachment_type = (attachment_type or "any").lower().strip()
 
@@ -502,6 +507,7 @@ def list_attachments(
     List all PostgreSQL-stored attachments for an email.
     """
 
+    auth0.require_scope("read:attachments")
     with SessionLocal() as database:
 
         email = database.get(
@@ -541,6 +547,7 @@ def list_attachments(
 
 @mcp.tool(structured_output=False)
 def get_attachment_content(attachment_id: int):
+    auth0.require_scope("read:attachments")
     db = SessionLocal()
 
     try:
@@ -566,6 +573,7 @@ def get_attachment_content(attachment_id: int):
 def extract_attachment_text(attachment_id: int) -> dict[str, Any]:
     from app.services.attachment_service import extract_text_from_attachment
 
+    auth0.require_scope("read:attachments")
     with SessionLocal() as database:
         attachment = database.get(EmailAttachment, attachment_id)
 

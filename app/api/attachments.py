@@ -25,6 +25,7 @@ from app.services.attachment_service import (
     get_image_dimensions,
     is_displayable_in_claude,
 )
+from app.services import auth0
 from app.schemas.email import AttachmentOut
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,10 @@ router = APIRouter()
 # NEW ATTACHMENT-SPECIFIC ENDPOINTS
 # ============================================================================
 
-@router.get("/attachments/{attachment_id}/metadata")
+@router.get(
+    "/attachments/{attachment_id}/metadata",
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
+)
 async def get_attachment_metadata(
     attachment_id: int,
     db: Session = Depends(get_db)
@@ -117,7 +121,10 @@ async def get_attachment_metadata(
         raise HTTPException(status_code=500, detail=f"Failed to get attachment: {str(e)}")
 
 
-@router.get("/attachments/{attachment_id}/base64")
+@router.get(
+    "/attachments/{attachment_id}/base64",
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
+)
 async def get_attachment_as_base64(
     attachment_id: int,
     db: Session = Depends(get_db)
@@ -161,7 +168,10 @@ async def get_attachment_as_base64(
         raise HTTPException(status_code=500, detail=f"Failed to encode attachment: {str(e)}")
 
 
-@router.get("/attachments/{attachment_id}/text")
+@router.get(
+    "/attachments/{attachment_id}/text",
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
+)
 async def extract_attachment_text(
     attachment_id: int,
     max_length: Optional[int] = Query(None, description="Truncate extracted text to this length"),
@@ -240,7 +250,10 @@ async def extract_attachment_text(
         raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
 
 
-@router.get("/attachments/{attachment_id}/image-info")
+@router.get(
+    "/attachments/{attachment_id}/image-info",
+    dependencies=[Depends(auth0.http_scope("read:attachments"))],
+)
 async def get_image_info(
     attachment_id: int,
     db: Session = Depends(get_db)
