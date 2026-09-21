@@ -42,7 +42,9 @@ def _issuer() -> str:
 
 
 def _redirect_uri() -> str:
-    return f"{settings.public_base_url.rstrip('/')}/admin/auth/callback"
+    return settings.admin_auth0_redirect_uri.strip() or (
+        f"{settings.public_base_url.rstrip('/')}/admin/auth/callback"
+    )
 
 
 def _session_claims(cookie: str | None) -> dict | None:

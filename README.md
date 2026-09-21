@@ -216,6 +216,14 @@ deployment environment. After login, the app stores only validated claims in
 an encrypted Secure, HttpOnly admin session cookie and redirects back to
 `/admin`.
 
+For the live deployment, set `ADMIN_AUTH0_REDIRECT_URI` to the exact value
+below and add the same value to Auth0 **Allowed Callback URLs** for client
+`tNEjkFjIVB2tMzieNP3vUWbhrlHO26AT`:
+
+```text
+https://email-connect-to-db.onrender.com/admin/auth/callback
+```
+
 Managed tokens use the same `Authorization: Bearer <token>` header for the
 MCP endpoint and protected attachment routes. Missing or invalid credentials
 return `401`; a valid credential without the required permission returns

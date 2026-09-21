@@ -24,6 +24,7 @@ class Settings(BaseSettings):
 	auth0_issuer: str = ""
 	auth0_client_id: str = ""
 	auth0_client_secret: str = ""
+	admin_auth0_redirect_uri: str = ""
 	admin_session_ttl_seconds: int = 3600
 
 	@model_validator(mode="after")
