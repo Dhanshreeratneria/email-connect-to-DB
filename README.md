@@ -163,15 +163,14 @@ They query PostgreSQL only and do not load or reveal Gmail OAuth credentials. Th
 ## Claude connection
 
 1. Deploy the service on a public HTTPS URL.
-2. Protect `/mcp` with an authenticated reverse proxy/API gateway; use a separate read-only MCP credential and never reuse Google OAuth credentials.
-3. In Claude’s connector/MCP configuration, add the remote endpoint:
+2. In Claude’s connector/MCP configuration, add the remote endpoint:
 
 ```text
 https://YOUR-DOMAIN/mcp
 ```
 
-4. Complete the connector authentication required by your gateway.
-5. Ask Claude, for example: “Find the latest email from Alice about the invoice and summarize the requested action.” Claude calls a read-only tool, receives matching PostgreSQL records, and answers from those records.
+3. Configure the connector bearer header as `Authorization: Bearer <MCP_API_KEY>`, using the same secret configured on the service. This direct bearer mode does not redirect through Google, Auth0, or `/authorize`.
+4. Ask Claude, for example: “Find the latest email from Alice about the invoice and summarize the requested action.” Claude calls a read-only tool, receives matching PostgreSQL records, and answers from those records.
 
 ### Auth0 authentication
 

@@ -1,4 +1,5 @@
 ﻿from contextlib import asynccontextmanager
+import hmac
 import logging
 
 from fastapi import FastAPI, Request, Depends
@@ -82,11 +83,18 @@ class RequireBearerToken:
         # Extract Authorization header
         headers = dict(scope.get("headers") or [])
         auth_header = headers.get(b"authorization", b"").decode()
-        token = auth_header[7:] if auth_header.lower().startswith("bearer ") else None
+        token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
         
+        # MCP_API_KEY is the static bearer credential documented for direct
+        # Claude connector setup. It must not enter the OAuth redirect flow.
+        if token and settings.mcp_api_key and hmac.compare_digest(token, settings.mcp_api_key):
+            token_data = {
+                "sub": "mcp-api-key",
+                "scope": "read:emails read:attachments download:attachments",
+            }
         # Managed MCP tokens are database credentials, not Auth0 JWTs.
         # Keep Auth0 and connector authentication unchanged for all other tokens.
-        if token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
+        elif token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
             with SessionLocal() as database:
                 token_data = admin_auth.validate_token(database, token)
         else:
