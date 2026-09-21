@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -22,11 +22,13 @@ from app.models.email import AdminClient, AdminToken
 from app.services import auth0
 from app.services.admin_auth import MCP_PERMISSIONS, issue_token, revoke_token, set_permissions
 
-router = APIRouter(prefix="/admin")
-
 SESSION_COOKIE = "admin_session"
 STATE_COOKIE = "admin_oauth_state"
 VERIFIER_COOKIE = "admin_oauth_verifier"
+ADMIN_PATH = "/admin"
+ADMIN_PERMISSION_ERROR = "Admin permission required"
+
+router = APIRouter(prefix=ADMIN_PATH)
 
 
 def _fernet() -> Fernet:
@@ -55,14 +57,14 @@ def _session_claims(cookie: str | None) -> dict | None:
         if claims.get("exp", 0) <= int(datetime.now(timezone.utc).timestamp()):
             return None
         return claims
-    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+    except (InvalidToken, ValueError, TypeError):
         return None
 
 
 class ClientInput(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     enabled: bool = True
-    permissions: set[str] = set()
+    permissions: set[str] = Field(default_factory=set)
 
 
 def require_admin(admin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict:
@@ -70,7 +72,7 @@ def require_admin(admin_session: str | None = Cookie(default=None, alias=SESSION
     if claims is None:
         raise HTTPException(status_code=401, detail="Admin login required")
     if not auth0.is_admin(claims):
-        raise HTTPException(status_code=403, detail="Admin permission required")
+        raise HTTPException(status_code=403, detail=ADMIN_PERMISSION_ERROR)
     return claims
 
 
@@ -95,8 +97,11 @@ def serialize_client(client: AdminClient) -> dict:
 
 @router.get("", response_class=HTMLResponse, include_in_schema=False)
 def admin_dashboard(admin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
-    if _session_claims(admin_session) is None:
-        return RedirectResponse("/admin/login", status_code=303)
+    claims = _session_claims(admin_session)
+    if claims is None:
+        return RedirectResponse(f"{ADMIN_PATH}/login", status_code=303)
+    if not auth0.is_admin(claims):
+        raise HTTPException(status_code=403, detail=ADMIN_PERMISSION_ERROR)
     return ADMIN_HTML
 
 
@@ -118,8 +123,8 @@ def admin_login():
         "state": state,
     })
     redirect = RedirectResponse(f"{_issuer()}/authorize?{query}", status_code=303)
-    redirect.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, secure=True, samesite="lax", path="/admin")
-    redirect.set_cookie(VERIFIER_COOKIE, verifier, max_age=600, httponly=True, secure=True, samesite="lax", path="/admin")
+    redirect.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, secure=True, samesite="lax", path=ADMIN_PATH)
+    redirect.set_cookie(VERIFIER_COOKIE, verifier, max_age=600, httponly=True, secure=True, samesite="lax", path=ADMIN_PATH)
     return redirect
 
 
@@ -151,7 +156,7 @@ async def admin_callback(
     if claims is None:
         raise HTTPException(status_code=401, detail="Unable to validate Auth0 admin login")
     if not auth0.is_admin(claims):
-        raise HTTPException(status_code=403, detail="Admin permission required")
+        raise HTTPException(status_code=403, detail=ADMIN_PERMISSION_ERROR)
 
     session_claims = {
         "sub": claims.get("sub"),
@@ -160,16 +165,16 @@ async def admin_callback(
         "exp": int(datetime.now(timezone.utc).timestamp()) + settings.admin_session_ttl_seconds,
     }
     session = _fernet().encrypt(json.dumps(session_claims).encode()).decode()
-    redirect = RedirectResponse("/admin", status_code=303)
-    redirect.delete_cookie(STATE_COOKIE, path="/admin")
-    redirect.delete_cookie(VERIFIER_COOKIE, path="/admin")
-    redirect.set_cookie(SESSION_COOKIE, session, max_age=settings.admin_session_ttl_seconds, httponly=True, secure=True, samesite="lax", path="/admin")
+    redirect = RedirectResponse(ADMIN_PATH, status_code=303)
+    redirect.delete_cookie(STATE_COOKIE, path=ADMIN_PATH)
+    redirect.delete_cookie(VERIFIER_COOKIE, path=ADMIN_PATH)
+    redirect.set_cookie(SESSION_COOKIE, session, max_age=settings.admin_session_ttl_seconds, httponly=True, secure=True, samesite="lax", path=ADMIN_PATH)
     return redirect
 
 
 @router.post("/logout", include_in_schema=False)
 def admin_logout(response: Response):
-    response.delete_cookie(SESSION_COOKIE, path="/admin")
+    response.delete_cookie(SESSION_COOKIE, path=ADMIN_PATH)
     return {"status": "logged_out"}
 
 

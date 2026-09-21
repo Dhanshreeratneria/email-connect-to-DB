@@ -1,5 +1,4 @@
 ﻿from contextlib import asynccontextmanager
-import json
 import logging
 
 from fastapi import FastAPI, Request, Depends
@@ -12,12 +11,10 @@ from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
 from app.api.attachments import router as attachments_router
-from app.api.admin import router as admin_router
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.mcp.server import mcp
-from app.services import auth0, connector_auth
-from app.services import admin_auth
+from app.services import admin_auth, auth0, connector_auth
 from app.services.oauth_service import authorization_url
 
 # Configure logging
@@ -56,7 +53,6 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 app.include_router(attachments_router)
-app.include_router(admin_router)
 
 # Configure MCP server
 logger.info("Configuring MCP server")
@@ -88,7 +84,11 @@ class RequireBearerToken:
         
         # Managed MCP tokens are database credentials, not Auth0 JWTs.
         # Keep Auth0 and connector authentication unchanged for all other tokens.
-        token_data = _validate_mcp_bearer_token(token)
+        if token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
+            with SessionLocal() as database:
+                token_data = admin_auth.validate_token(database, token)
+        else:
+            token_data = auth0.safe_validate_token(token)
 
         if not token_data:
             base = settings.public_base_url.rstrip("/")
@@ -109,74 +109,11 @@ class RequireBearerToken:
             await response(scope, receive, send)
             return
 
-        replay_events = []
-        if scope.get("method") == "POST":
-            while True:
-                event = await receive()
-                replay_events.append(event)
-                if not event.get("more_body"):
-                    break
-
-            if token_data:
-                body = b"".join(event.get("body", b"") for event in replay_events)
-                required_scope = _required_mcp_scope(body, headers)
-                if required_scope and required_scope not in auth0.scopes_from_claims(token_data):
-                    response = JSONResponse(
-                        {
-                            "error": "insufficient_scope",
-                            "error_description": f"Missing required scope: {required_scope}",
-                        },
-                        status_code=403,
-                        headers=auth0.unauthorized_response_headers(
-                            settings.public_base_url, "insufficient_scope"
-                        ),
-                    )
-                    await response(scope, receive, send)
-                    return
-
-                event_index = 0
-
-                async def replay_receive():
-                    nonlocal event_index
-                    if event_index < len(replay_events):
-                        event = replay_events[event_index]
-                        event_index += 1
-                        return event
-                    return {"type": "http.request", "body": b"", "more_body": False}
-
-                receive = replay_receive
-
         claims_token = auth0.set_claims(token_data)
         try:
             await self.inner_app(scope, receive, send)
         finally:
             auth0.reset_claims(claims_token)
-
-
-def _required_mcp_scope(body: bytes, headers: dict[bytes, bytes]) -> str | None:
-    content_type = headers.get(b"content-type", b"").decode().lower()
-    if "json" not in content_type:
-        return None
-    try:
-        payload = json.loads(body or b"{}")
-    except (TypeError, ValueError):
-        return None
-    if payload.get("method") != "tools/call":
-        return None
-    tool_name = payload.get("params", {}).get("name")
-    if tool_name in {"get_email", "list_emails", "get_thread", "search_emails_with_attachments"}:
-        return "read:emails"
-    if tool_name in {"list_attachments", "get_attachment_content", "extract_attachment_text"}:
-        return "read:attachments"
-    return None
-
-
-def _validate_mcp_bearer_token(token: str | None) -> dict | None:
-    """Validate managed MCP tokens without logging or exposing the raw token."""
-    if token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
-        with SessionLocal() as database:
-            return admin_auth.validate_token(database, token)
-    return auth0.safe_validate_token(token)
 
 
 # Mount MCP endpoint with Bearer token protection
