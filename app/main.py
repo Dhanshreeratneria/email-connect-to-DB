@@ -11,6 +11,7 @@ from app.api.auth import router as auth_router
 from app.api.webhook import router as webhook_router
 from app.api.emails import router as emails_router
 from app.api.attachments import router as attachments_router
+from app.api.admin import router as admin_router
 from app.config import settings
 from app.database import SessionLocal, get_db
 from app.mcp.server import mcp
@@ -53,10 +54,11 @@ app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 app.include_router(attachments_router)
+app.include_router(admin_router)
 
 # Configure MCP server
 logger.info("Configuring MCP server")
-mcp.settings.streamable_http_path = "/mcp"
+mcp.settings.streamable_http_path = "/"
 mcp.settings.transport_security = TransportSecuritySettings(
     allowed_hosts=["email-connect-to-db.onrender.com"],
     allowed_origins=["*"],
