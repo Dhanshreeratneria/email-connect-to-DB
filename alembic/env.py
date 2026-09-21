@@ -8,13 +8,13 @@ from sqlalchemy import engine_from_config,pool
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import settings
-from app.database import Base
+from app.database import Base, normalize_database_url
 from app.models.email import Email, EmailAttachment, EmailDelivery, GmailAccount
 config=context.config
-config.set_main_option("sqlalchemy.url",settings.database_url)
+config.set_main_option("sqlalchemy.url",normalize_database_url(settings.database_url))
 if config.config_file_name: fileConfig(config.config_file_name)
 target_metadata=Base.metadata
-def run_migrations_offline(): context.configure(url=settings.database_url,target_metadata=target_metadata,literal_binds=True,dialect_opts={"paramstyle":"named"});
+def run_migrations_offline(): context.configure(url=normalize_database_url(settings.database_url),target_metadata=target_metadata,literal_binds=True,dialect_opts={"paramstyle":"named"});
 
 # Alembic executes the online path below.
 def run_migrations_online():

@@ -62,6 +62,11 @@ python -c "from app.database import engine; from sqlalchemy import text; print(e
 
 Expected output: `1`.
 
+For Render, set `DATABASE_URL` to the PostgreSQL database's **Internal
+Database URL**. Do not use `localhost`; in a deployed web service,
+`localhost` refers to the application container. The application accepts
+Render's `postgresql://` URL and normalizes it to the psycopg 3 driver.
+
 ## Local setup
 
 ```powershell

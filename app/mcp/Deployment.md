@@ -33,11 +33,14 @@ Render's internal URL looks like:
 postgresql://gmail_mcp:xxxxxxxx@dpg-xxxxxxxxxxxx-a/gmail_email_db
 ```
 
-This project's SQLAlchemy engine expects the `psycopg` driver, so prefix it:
+This project's SQLAlchemy engine uses the psycopg 3 driver. The application
+normalizes a normal Render `postgresql://` URL automatically. If you prefer
+to set the driver explicitly, use `postgresql+psycopg://`:
 ```
 postgresql+psycopg://gmail_mcp:xxxxxxxx@dpg-xxxxxxxxxxxx-a/gmail_email_db
 ```
-(Copy the value straight from Render, then just add `+psycopg` after `postgresql`.)
+(Do not use `localhost` in a deployed Render service; that points back to the
+web service container, not the Render PostgreSQL database.)
 
 ## 3. Create the Web Service
 
@@ -62,7 +65,7 @@ On the web service → **Environment** tab, add each of these. Mark the sensitiv
 
 | Key | Value | Notes |
 |---|---|---|
-| `DATABASE_URL` | the Internal Database URL from step 2, with `+psycopg` added | secret |
+| `DATABASE_URL` | the Internal Database URL from step 2 (or `postgresql+psycopg://...`) | secret |
 | `PUBLIC_BASE_URL` | `https://YOUR-SERVICE.onrender.com` | your Render URL, known after first deploy |
 | `GOOGLE_CLIENT_SECRETS_FILE` | `credentials.json` | see step 5 |
 | `GOOGLE_OAUTH_REDIRECT_URI` | `https://YOUR-SERVICE.onrender.com/auth/google/callback` | must exactly match what's registered in Google Cloud Console |
