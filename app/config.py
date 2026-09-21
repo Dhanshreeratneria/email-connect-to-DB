@@ -23,6 +23,8 @@ class Settings(BaseSettings):
 	auth0_api_audience: str = ""
 	auth0_issuer: str = ""
 	auth0_client_id: str = ""
+	auth0_client_secret: str = ""
+	admin_session_ttl_seconds: int = 3600
 
 	@model_validator(mode="after")
 	def validate_production_database(self):

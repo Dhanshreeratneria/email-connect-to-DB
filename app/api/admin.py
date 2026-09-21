@@ -1,19 +1,60 @@
 from __future__ import annotations
 
-from datetime import datetime
+import base64
+import hashlib
+import json
+import secrets
+from datetime import datetime, timezone
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.config import settings
 from app.models.email import AdminClient, AdminToken
 from app.services import auth0
 from app.services.admin_auth import MCP_PERMISSIONS, issue_token, revoke_token, set_permissions
 
 router = APIRouter(prefix="/admin")
+
+SESSION_COOKIE = "admin_session"
+STATE_COOKIE = "admin_oauth_state"
+VERIFIER_COOKIE = "admin_oauth_verifier"
+
+
+def _fernet() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(settings.token_encryption_key.encode()).digest())
+    return Fernet(key)
+
+
+def _issuer() -> str:
+    issuer = settings.auth0_issuer.strip()
+    if issuer:
+        return issuer.rstrip("/")
+    return f"https://{settings.auth0_domain.strip().rstrip('/')}"
+
+
+def _redirect_uri() -> str:
+    return f"{settings.public_base_url.rstrip('/')}/admin/auth/callback"
+
+
+def _session_claims(cookie: str | None) -> dict | None:
+    if not cookie:
+        return None
+    try:
+        claims = json.loads(_fernet().decrypt(cookie.encode()).decode())
+        if claims.get("exp", 0) <= int(datetime.now(timezone.utc).timestamp()):
+            return None
+        return claims
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 class ClientInput(BaseModel):
@@ -22,12 +63,10 @@ class ClientInput(BaseModel):
     permissions: set[str] = set()
 
 
-def require_admin(request: Request) -> dict:
-    authorization = request.headers.get("authorization", "")
-    token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
-    claims = auth0.safe_validate_token(token)
+def require_admin(admin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict:
+    claims = _session_claims(admin_session)
     if claims is None:
-        raise HTTPException(status_code=401, detail="Missing or invalid Auth0 access token")
+        raise HTTPException(status_code=401, detail="Admin login required")
     if not auth0.is_admin(claims):
         raise HTTPException(status_code=403, detail="Admin permission required")
     return claims
@@ -53,8 +92,83 @@ def serialize_client(client: AdminClient) -> dict:
 
 
 @router.get("", response_class=HTMLResponse, include_in_schema=False)
-def admin_dashboard(_: dict = Depends(require_admin)) -> str:
+def admin_dashboard(admin_session: str | None = Cookie(default=None, alias=SESSION_COOKIE)):
+    if _session_claims(admin_session) is None:
+        return RedirectResponse("/admin/login", status_code=303)
     return ADMIN_HTML
+
+
+@router.get("/login", include_in_schema=False)
+def admin_login():
+    if not settings.auth0_domain or not settings.auth0_client_id:
+        raise HTTPException(status_code=503, detail="Auth0 admin login is not configured")
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    query = urlencode({
+        "response_type": "code",
+        "client_id": settings.auth0_client_id,
+        "redirect_uri": _redirect_uri(),
+        "scope": "openid profile email admin:manage",
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "audience": settings.auth0_api_audience,
+        "state": state,
+    })
+    redirect = RedirectResponse(f"{_issuer()}/authorize?{query}", status_code=303)
+    redirect.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, secure=True, samesite="lax", path="/admin")
+    redirect.set_cookie(VERIFIER_COOKIE, verifier, max_age=600, httponly=True, secure=True, samesite="lax", path="/admin")
+    return redirect
+
+
+@router.get("/auth/callback", include_in_schema=False)
+async def admin_callback(
+    code: str,
+    state: str,
+    admin_oauth_state: str | None = Cookie(default=None, alias=STATE_COOKIE),
+    admin_oauth_verifier: str | None = Cookie(default=None, alias=VERIFIER_COOKIE),
+):
+    if not admin_oauth_state or not admin_oauth_verifier or not secrets.compare_digest(state, admin_oauth_state):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": settings.auth0_client_id,
+        "code": code,
+        "redirect_uri": _redirect_uri(),
+        "code_verifier": admin_oauth_verifier,
+    }
+    if settings.auth0_client_secret:
+        form["client_secret"] = settings.auth0_client_secret
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            token_response = await client.post(f"{_issuer()}/oauth/token", data=form)
+        token_response.raise_for_status()
+        claims = auth0.safe_validate_token(token_response.json().get("access_token"))
+    except (httpx.HTTPError, ValueError, TypeError):
+        claims = None
+    if claims is None:
+        raise HTTPException(status_code=401, detail="Unable to validate Auth0 admin login")
+    if not auth0.is_admin(claims):
+        raise HTTPException(status_code=403, detail="Admin permission required")
+
+    session_claims = {
+        "sub": claims.get("sub"),
+        "scope": claims.get("scope", ""),
+        "permissions": claims.get("permissions", []),
+        "exp": int(datetime.now(timezone.utc).timestamp()) + settings.admin_session_ttl_seconds,
+    }
+    session = _fernet().encrypt(json.dumps(session_claims).encode()).decode()
+    redirect = RedirectResponse("/admin", status_code=303)
+    redirect.delete_cookie(STATE_COOKIE, path="/admin")
+    redirect.delete_cookie(VERIFIER_COOKIE, path="/admin")
+    redirect.set_cookie(SESSION_COOKIE, session, max_age=settings.admin_session_ttl_seconds, httponly=True, secure=True, samesite="lax", path="/admin")
+    return redirect
+
+
+@router.post("/logout", include_in_schema=False)
+def admin_logout(response: Response):
+    response.delete_cookie(SESSION_COOKIE, path="/admin")
+    return {"status": "logged_out"}
 
 
 @router.get("/api/clients")

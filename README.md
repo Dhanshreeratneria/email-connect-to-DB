@@ -198,11 +198,23 @@ The protected-resource metadata is available at
 ### Admin authorization
 
 Run `alembic upgrade head` to create the admin authorization tables. The
-Auth0 access token used to open `/admin` must include the `admin:manage`
-permission. The dashboard can create and disable MCP clients, assign
+open `/admin` route redirects through Auth0. Configure this callback URL in
+the Auth0 application:
+
+```text
+https://email-connect-to-db.onrender.com/admin/auth/callback
+```
+
+The Auth0 API must grant the `admin:manage` permission. The dashboard can create and disable MCP clients, assign
 `read:emails`, `read:attachments`, and `download:attachments`, generate
 tokens, and revoke tokens. Tokens are displayed only once and only their
 SHA-256 hashes are stored in PostgreSQL.
+
+The callback uses PKCE and supports public Auth0 applications. For a
+confidential Auth0 application, also set `AUTH0_CLIENT_SECRET` in the
+deployment environment. After login, the app stores only validated claims in
+an encrypted Secure, HttpOnly admin session cookie and redirects back to
+`/admin`.
 
 Managed tokens use the same `Authorization: Bearer <token>` header for the
 MCP endpoint and protected attachment routes. Missing or invalid credentials
