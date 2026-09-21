@@ -195,6 +195,19 @@ The protected-resource metadata is available at
 `/.well-known/oauth-protected-resource`, and the MCP URL remains
 `https://email-connect-to-db.onrender.com/mcp`.
 
+### Admin authorization
+
+Run `alembic upgrade head` to create the admin authorization tables. The
+Auth0 access token used to open `/admin` must include the `admin:manage`
+permission. The dashboard can create and disable MCP clients, assign
+`read:emails`, `read:attachments`, and `download:attachments`, generate
+tokens, and revoke tokens. Tokens are displayed only once and only their
+SHA-256 hashes are stored in PostgreSQL.
+
+Managed tokens use the same `Authorization: Bearer <token>` header for the
+MCP endpoint and protected attachment routes. Missing or invalid credentials
+return `401`; a valid credential without the required permission returns
+`403`.
 ## Render deployment
 
 Create a Render PostgreSQL database. Set `DATABASE_URL` to Render’s internal PostgreSQL URL. Deploy this repository as a Python Web Service:

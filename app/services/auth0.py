@@ -107,7 +107,11 @@ def safe_validate_token(token: str | None) -> dict[str, Any] | None:
     except Auth0ConfigurationError:
         connector_token = connector_auth.verify_access_token(token)
         if not connector_token:
-            return None
+            from app.database import SessionLocal
+            from app.services.admin_auth import validate_token as validate_managed_token
+
+            with SessionLocal() as database:
+                return validate_managed_token(database, token)
         return {
             "sub": connector_token["google_email"],
             "email": connector_token["google_email"],
@@ -144,6 +148,13 @@ def current_scopes() -> set[str]:
 def require_scope(scope: str) -> None:
     if scope not in current_scopes():
         raise PermissionError(f"Missing required scope: {scope}")
+
+
+ADMIN_SCOPE = "admin:manage"
+
+
+def is_admin(claims: dict[str, Any]) -> bool:
+    return ADMIN_SCOPE in scopes_from_claims(claims)
 
 
 def unauthorized_response_headers(base_url: str, error: str = "invalid_token") -> dict[str, str]:

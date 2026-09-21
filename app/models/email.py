@@ -142,3 +142,50 @@ class PubSubEvent(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class AdminClient(Base):
+    __tablename__ = "admin_clients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    tokens: Mapped[list["AdminToken"]] = relationship(
+        back_populates="client", cascade="all, delete-orphan"
+    )
+    permissions: Mapped[list["AdminClientPermission"]] = relationship(
+        back_populates="client", cascade="all, delete-orphan"
+    )
+
+
+class AdminToken(Base):
+    __tablename__ = "admin_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("admin_clients.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    token_prefix: Mapped[str] = mapped_column(String(24), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    client: Mapped["AdminClient"] = relationship(back_populates="tokens")
+
+
+class AdminClientPermission(Base):
+    __tablename__ = "admin_client_permissions"
+    __table_args__ = (UniqueConstraint("client_id", "permission", name="uq_admin_client_permission"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("admin_clients.id", ondelete="CASCADE"), index=True
+    )
+    permission: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    client: Mapped["AdminClient"] = relationship(back_populates="permissions")
