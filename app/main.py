@@ -56,7 +56,7 @@ app.include_router(attachments_router)
 
 # Configure MCP server
 logger.info("Configuring MCP server")
-mcp.settings.streamable_http_path = "/"
+mcp.settings.streamable_http_path = "/mcp"
 mcp.settings.transport_security = TransportSecuritySettings(
     allowed_hosts=["email-connect-to-db.onrender.com"],
     allowed_origins=["*"],
