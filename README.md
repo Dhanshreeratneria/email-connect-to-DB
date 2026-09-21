@@ -145,7 +145,7 @@ Use `/docs` for interactive local testing. Email REST endpoints should be protec
 The mounted Streamable HTTP MCP endpoint is:
 
 ```text
-https://YOUR-DOMAIN/mcp
+https://YOUR-DOMAIN/mcp/
 ```
 
 Tools:
@@ -166,15 +166,15 @@ They query PostgreSQL only and do not load or reveal Gmail OAuth credentials. Th
 2. In Claude’s connector/MCP configuration, add the remote endpoint:
 
 ```text
-https://YOUR-DOMAIN/mcp
+https://YOUR-DOMAIN/mcp/
 ```
 
-3. Configure the connector bearer header as `Authorization: Bearer <MCP_API_KEY>`, using the same secret configured on the service. This direct bearer mode does not redirect through Google, Auth0, or `/authorize`.
+3. Configure the connector bearer header as `Authorization: Bearer <MCP_API_KEY>`, using the same secret configured on the service. Use the trailing-slash endpoint exactly as shown. This direct bearer mode does not redirect through Google, Auth0, or `/authorize`.
 4. Ask Claude, for example: “Find the latest email from Alice about the invoice and summarize the requested action.” Claude calls a read-only tool, receives matching PostgreSQL records, and answers from those records.
 
 ### Auth0 authentication
 
-The `/mcp` resource accepts Auth0 RS256 access tokens. Configure these
+The `/mcp/` resource accepts Auth0 RS256 access tokens. Configure these
 environment variables without committing secrets:
 
 ```text
@@ -192,7 +192,7 @@ Auth0 must issue the following scopes:
 
 The protected-resource metadata is available at
 `/.well-known/oauth-protected-resource`, and the MCP URL remains
-`https://email-connect-to-db.onrender.com/mcp`.
+`https://email-connect-to-db.onrender.com/mcp/`.
 
 ### Admin authorization
 

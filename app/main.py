@@ -147,14 +147,14 @@ def root():
         "version": "1.0",
         "status": "running",
         "description": "Connect your Gmail to Claude.ai via MCP (Model Context Protocol)",
-        "mcp_endpoint": f"{base}/mcp",
+        "mcp_endpoint": f"{base}/mcp/",
         "endpoints": {
             "health": "/health",
             "authorize": "/authorize",
             "token": "/token",
             "register": "/register",
             "connector_status": "/connector/status",
-            "mcp": "/mcp",
+            "mcp": "/mcp/",
             "mcp_info": "/mcp/info",
             "emails": "/emails",
             "auth": "/auth/google",
@@ -170,7 +170,7 @@ def connector_status():
         "name": "Gmail Email MCP",
         "version": "1.0",
         "endpoints": {
-            "mcp": "/mcp",
+            "mcp": "/mcp/",
             "emails": "/emails",
             "health": "/health"
         },
@@ -185,7 +185,7 @@ def mcp_info():
         "name": "Gmail Email MCP",
         "version": "1.0",
         "status": "ready",
-        "url": f"{base}/mcp",
+        "url": f"{base}/mcp/",
         "capabilities": {
             "tools": [
                 "search_emails",
@@ -233,7 +233,7 @@ def protected_resource_metadata():
     """Protected resource metadata endpoint"""
     base = settings.public_base_url.rstrip("/")
     return {
-        "resource": f"{base}/mcp",
+        "resource": f"{base}/mcp/",
         "authorization_servers": [base],
         "scopes_supported": ["read:emails", "read:attachments", "download:attachments"],
         "bearer_methods_supported": ["header"],
