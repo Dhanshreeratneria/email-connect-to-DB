@@ -1,19 +1,23 @@
 import base64
 import json
 import logging
+import threading
+from collections import defaultdict
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import get_db
-from app.models.email import GmailAccount
+from app.database import SessionLocal, get_db
+from app.models.email import GmailAccount, PubSubEvent
 from app.services.gmail_service import gmail
 from app.services.oauth_service import decrypt_credentials
 from app.services.sync_service import incremental_sync
 
 
 logger = logging.getLogger(__name__)
+_account_sync_locks: defaultdict[int, threading.Lock] = defaultdict(threading.Lock)
 
 # Must match the Google Pub/Sub push subscription URL:
 # https://YOUR-DOMAIN/webhooks/google/pubsub
@@ -24,9 +28,7 @@ router = APIRouter(
 
 
 def _run_incremental_sync(
-    db: Session,
-    account: GmailAccount,
-    gmail_service,
+    account_id: int,
     notification_history_id: str,
     google_email: str,
 ) -> None:
@@ -37,35 +39,37 @@ def _run_incremental_sync(
     incremental_sync() uses account.history_id to determine where
     the previous sync stopped.
     """
-    try:
-        logger.info(
-            "Starting Gmail incremental sync email=%s "
-            "notification_history_id=%s account_history_id=%s",
-            google_email,
-            notification_history_id,
-            account.history_id,
-        )
+    with _account_sync_locks[account_id]:
+        db = SessionLocal()
+        try:
+            account = db.get(GmailAccount, account_id)
+            if account is None:
+                raise RuntimeError(f"Gmail account {account_id} no longer exists")
 
-        # IMPORTANT:
-        # Do NOT pass notification_history_id here.
-        imported_count = incremental_sync(
-            db=db,
-            account=account,
-            gmail_service=gmail_service,
-        )
-
-        logger.info(
-            "Pub/Sub Gmail sync completed email=%s imported=%s history_id=%s",
-            google_email,
-            imported_count,
-            account.history_id,
-        )
-
-    except Exception:
-        logger.exception(
-            "Background Gmail sync failed for %s",
-            google_email,
-        )
+            logger.info(
+                "Starting Gmail incremental sync email=%s "
+                "notification_history_id=%s account_history_id=%s",
+                google_email,
+                notification_history_id,
+                account.history_id,
+            )
+            credentials = decrypt_credentials(account.encrypted_token)
+            imported_count = incremental_sync(
+                db=db,
+                account=account,
+                gmail_service=gmail(credentials),
+            )
+            logger.info(
+                "Pub/Sub Gmail sync completed email=%s imported=%s history_id=%s",
+                google_email,
+                imported_count,
+                account.history_id,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Background Gmail sync failed for %s", google_email)
+        finally:
+            db.close()
 
 
 @router.post("/pubsub")
@@ -152,6 +156,21 @@ async def gmail_pubsub_webhook(
                 "Gmail notification missing historyId"
             )
 
+        pubsub_message_id = str(
+            pubsub_message.get("messageId")
+            or pubsub_message.get("message_id")
+            or encoded_data
+        )
+        try:
+            with db.begin_nested():
+                db.add(PubSubEvent(pubsub_message_id=pubsub_message_id))
+                db.flush()
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            logger.info("Ignoring duplicate Pub/Sub message %s", pubsub_message_id)
+            return {"status": "duplicate", "pubsub_message_id": pubsub_message_id}
+
         logger.info(
             "Gmail notification received email=%s "
             "notification_history_id=%s",
@@ -183,22 +202,11 @@ async def gmail_pubsub_webhook(
             }
 
         # ---------------------------------------------------------
-        # 4. Decrypt stored Gmail credentials
-        # ---------------------------------------------------------
-        credentials = decrypt_credentials(
-            account.encrypted_token
-        )
-
-        gmail_service = gmail(credentials)
-
-        # ---------------------------------------------------------
         # 5. Schedule background Gmail sync
         # ---------------------------------------------------------
         background_tasks.add_task(
             _run_incremental_sync,
-            db,
-            account,
-            gmail_service,
+            account.id,
             str(notification_history_id),
             google_email,
         )

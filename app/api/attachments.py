@@ -105,6 +105,8 @@ async def get_attachment_metadata(
             "created_at": attachment.created_at.isoformat() if attachment.created_at else None,
             "is_displayable": is_displayable_in_claude(attachment.mime_type),
             "has_content": attachment.content is not None,
+            "download_url": f"/attachments/{attachment.id}/download",
+            "view_url": f"/attachments/{attachment.id}/view",
             "content_type_category": category,
         }
     

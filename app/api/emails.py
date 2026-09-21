@@ -180,6 +180,27 @@ async def download_attachment_by_id(
     )
 
 
+@router.get("/attachments/{attachment_id}/view")
+async def view_attachment_by_id(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+) -> Response:
+    """Render a stored attachment inline for Claude-capable clients."""
+    attachment = db.scalar(
+        select(EmailAttachment).where(EmailAttachment.id == attachment_id)
+    )
+    if not attachment or attachment.content is None:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    return Response(
+        content=attachment.content,
+        media_type=attachment.mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{attachment.filename}"'
+        },
+    )
+
+
 @router.get("/emails/{message_id}/attachments/{attachment_id}/download")
 async def download_email_attachment(
     message_id: str,

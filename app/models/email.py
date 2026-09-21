@@ -130,3 +130,15 @@ class EmailAttachment(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     email: Mapped["Email"] = relationship(back_populates="stored_attachments")
+
+
+class PubSubEvent(Base):
+    """Durable idempotency record for a Pub/Sub push message."""
+
+    __tablename__ = "pubsub_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    pubsub_message_id: Mapped[str] = mapped_column(String(512), unique=True, index=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

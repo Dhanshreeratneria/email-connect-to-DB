@@ -44,6 +44,7 @@ class AttachmentOut(BaseModel):
     # — callers had to hand-build the URL themselves from `id`.
     is_displayable: bool = False
     download_url: str = ""
+    view_url: str = ""
 
     class Config:
         from_attributes = True
@@ -53,6 +54,7 @@ class AttachmentOut(BaseModel):
         self.is_displayable = is_displayable_in_claude(self.mime_type)
         base = settings.public_base_url.rstrip("/")
         self.download_url = f"{base}/attachments/{self.id}/download"
+        self.view_url = f"{base}/attachments/{self.id}/view"
         return self
 
 

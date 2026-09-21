@@ -39,6 +39,7 @@ def group_recipients(recipients: Any) -> dict[str, list[dict[str, Any]]]:
         "to": [],
         "cc": [],
         "bcc": [],
+        "unknown": [],
     }
 
     if not recipients:
@@ -53,6 +54,9 @@ def group_recipients(recipients: Any) -> dict[str, list[dict[str, Any]]]:
 
     if isinstance(recipients, list):
         for recipient in recipients:
+            if isinstance(recipient, str):
+                result["unknown"].append({"email": recipient})
+                continue
             if not isinstance(recipient, dict):
                 continue
 
@@ -109,6 +113,15 @@ def serialize_email(email: Email) -> dict[str, Any]:
     }
 
 
+def serialize(email: Email) -> dict[str, Any]:
+    """Backward-compatible serializer for older MCP clients."""
+    result = serialize_email(email)
+    result["recipient_count"] = sum(
+        len(values) for values in result["recipients"].values()
+    )
+    return result
+
+
 def serialize_attachment(
     attachment: EmailAttachment,
     include_content: bool = False,
@@ -124,6 +137,14 @@ def serialize_attachment(
         "mime_type": attachment.mime_type,
         "size": attachment.size,
         "content_stored": attachment.content is not None,
+        "download_url": attachment_download_url(attachment.id),
+        "view_url": attachment_view_url(attachment.id),
+        "is_displayable": bool(
+            attachment.content and (
+                (attachment.mime_type or "").lower().startswith("image/")
+                or (attachment.mime_type or "").lower() == "application/pdf"
+            )
+        ),
     }
 
     if include_content and attachment.content is not None:
@@ -153,6 +174,10 @@ def attachment_download_url(attachment_id: int) -> str:
         f"{base_url}/attachments/"
         f"{attachment_id}/download"
     )
+
+
+def attachment_view_url(attachment_id: int) -> str:
+    return f"{str(settings.public_base_url).rstrip('/')}/attachments/{attachment_id}/view"
 
 
 def attachment_type_condition(attachment_type: str):
@@ -195,7 +220,7 @@ def attachment_type_condition(attachment_type: str):
 
 
 
-def attachment_to_content_blocks(attachment):
+def attachment_to_content_blocks(database, attachment):
     import mimetypes
 
     if not attachment.content:
@@ -212,6 +237,7 @@ def attachment_to_content_blocks(attachment):
         mime_type = guessed or "application/octet-stream"
 
     download_url = attachment_download_url(attachment.id)
+    view_url = attachment_view_url(attachment.id)
 
     if mime_type.startswith("image/"):
         encoded = base64.b64encode(attachment.content).decode("utf-8")
@@ -222,7 +248,7 @@ def attachment_to_content_blocks(attachment):
                     f"Image: {attachment.filename}\n"
                     f"MIME type: {mime_type}\n"
                     f"Size: {attachment.size} bytes\n"
-                    f"Download: {download_url}"
+                    f"View: {view_url}\nDownload: {download_url}"
                 )
             ),
             ImageContent(
@@ -232,11 +258,64 @@ def attachment_to_content_blocks(attachment):
             ),
         ]
 
+    if mime_type == "application/pdf":
+        from app.services.attachment_service import extract_text_from_attachment
+
+        blocks = [
+            TextContent(
+                type="text",
+                text=(
+                    f"PDF: {attachment.filename}\n"
+                    f"View: {view_url}\nDownload: {download_url}"
+                ),
+            )
+        ]
+        extracted_text = extract_text_from_attachment(database, attachment.id)
+        if extracted_text:
+            blocks.append(
+                TextContent(type="text", text=f"Extracted PDF text:\n{extracted_text}")
+            )
+        try:
+            import fitz
+
+            document = fitz.open(stream=attachment.content, filetype="pdf")
+            for page_number in range(min(5, document.page_count)):
+                page = document[page_number]
+                image = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+                blocks.append(
+                    ImageContent(
+                        type="image",
+                        data=base64.b64encode(image.tobytes("png")).decode("utf-8"),
+                        mimeType="image/png",
+                    )
+                )
+            document.close()
+        except Exception:
+            logger.exception("Failed to render PDF attachment %s", attachment.id)
+        return blocks
+
+    from app.services.attachment_service import extract_text_from_attachment
+
+    extracted_text = extract_text_from_attachment(database, attachment.id)
+    if extracted_text:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    f"Attachment: {attachment.filename}\n"
+                    f"MIME type: {mime_type}\n"
+                    f"View: {view_url}\nDownload: {download_url}\n\n"
+                    f"Extracted text:\n{extracted_text}"
+                ),
+            )
+        ]
+
     return [
         TextContent(
             type="text",
             text=f"Attachment: {attachment.filename}\n"
                  f"MIME type: {mime_type}\n"
+                 f"View: {view_url}\n"
                  f"Download: {download_url}"
         )
     ]
@@ -474,7 +553,7 @@ def get_attachment_content(attachment_id: int):
         if not attachment:
             return "Attachment not found"
 
-        return attachment_to_content_blocks(attachment)
+        return attachment_to_content_blocks(db, attachment)
 
     finally:
         db.close()

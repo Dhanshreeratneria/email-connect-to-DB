@@ -273,8 +273,6 @@ def _get_or_create_email(db: Session, parsed_email: dict):
         return email
 
     except IntegrityError:
-        db.rollback()
-
         existing = db.scalar(
             select(Email).where(
                 Email.rfc_message_id == rfc_message_id
@@ -417,6 +415,7 @@ def record_email_delivery(
         parsed = parse_message(message)
 
         attachments_meta = parsed.get("attachments") or []
+        _merge_attachment_metadata(email, attachments_meta)
 
         successful, failed = store_attachments(
             db=db,
@@ -637,8 +636,6 @@ def initial_sync(
                 db.commit()
 
             except Exception:
-                db.rollback()
-
                 stats["failures"] += 1
 
                 logger.exception(

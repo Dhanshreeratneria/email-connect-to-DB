@@ -9,6 +9,7 @@ Handles:
 """
 
 import base64
+import json
 import logging
 import os
 import shutil
@@ -284,6 +285,7 @@ def extract_text_from_attachment(
         return None
     
     mime_type = (attachment.mime_type or "").lower()
+    filename = (attachment.filename or "").lower()
     
     try:
         # Image OCR
@@ -291,7 +293,7 @@ def extract_text_from_attachment(
             return _ocr_image_bytes(attachment.content)
 
         # PDF extraction
-        if "pdf" in mime_type:
+        if "pdf" in mime_type or filename.endswith(".pdf"):
             import fitz  # PyMuPDF
             
             doc = fitz.open(stream=attachment.content, filetype="pdf")
@@ -323,7 +325,7 @@ def extract_text_from_attachment(
             return text.strip() if text.strip() else None
         
         # DOCX extraction
-        elif "wordprocessingml" in mime_type or mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        elif "wordprocessingml" in mime_type or filename.endswith(".docx"):
             from docx import Document
             
             doc = Document(BytesIO(attachment.content))
@@ -331,7 +333,7 @@ def extract_text_from_attachment(
             return text.strip() if text.strip() else None
         
         # XLSX extraction
-        elif "spreadsheetml" in mime_type or mime_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
+        elif "spreadsheetml" in mime_type or filename.endswith(".xlsx"):
             from openpyxl import load_workbook
             
             wb = load_workbook(BytesIO(attachment.content))
@@ -344,7 +346,7 @@ def extract_text_from_attachment(
             return "\n".join(text_lines).strip()
         
         # PPTX extraction
-        elif "presentationml" in mime_type:
+        elif "presentationml" in mime_type or filename.endswith(".pptx"):
             from pptx import Presentation
             
             prs = Presentation(BytesIO(attachment.content))
@@ -357,8 +359,15 @@ def extract_text_from_attachment(
             return "\n".join(text_lines).strip()
         
         # Plain text
-        elif "text/plain" in mime_type:
+        elif "text/plain" in mime_type or filename.endswith((".txt", ".log")):
             return attachment.content.decode("utf-8", errors="replace").strip()
+
+        elif "text/csv" in mime_type or filename.endswith(".csv"):
+            return attachment.content.decode("utf-8", errors="replace").strip()
+
+        elif "application/json" in mime_type or filename.endswith(".json"):
+            value = json.loads(attachment.content.decode("utf-8", errors="replace"))
+            return json.dumps(value, ensure_ascii=False, indent=2)
         
         # RTF extraction
         elif "rtf" in mime_type:
