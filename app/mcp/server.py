@@ -28,6 +28,16 @@ mcp = FastMCP(
 )
 
 
+def _image_content(data: str, mime_type: str) -> ImageContent:
+    """Construct native ImageContent across MCP SDK field-name versions."""
+    try:
+        return ImageContent(type="image", data=data, mime_type=mime_type)
+    except TypeError:
+        return ImageContent(type="image", data=data, mimeType=mime_type)
+    except ValueError:
+        return ImageContent(type="image", data=data, mimeType=mime_type)
+
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -242,31 +252,8 @@ def attachment_to_content_blocks(database, attachment):
 
     if mime_type.startswith("image/"):
         encoded = base64.b64encode(attachment.content).decode("utf-8")
-        image_content_args = {
-            "type": "image",
-            "data": encoded,
-        }
-        if "mime_type" in ImageContent.model_fields:
-            image_content = ImageContent(
-                **image_content_args,
-                mime_type=mime_type,
-            )
-        else:
-            image_content = ImageContent(
-                **image_content_args,
-                mimeType=mime_type,
-            )
         return [
-            TextContent(
-                type="text",
-                text=(
-                    f"Image: {attachment.filename}\n"
-                    f"MIME type: {mime_type}\n"
-                    f"Size: {attachment.size} bytes\n"
-                    f"View: {view_url}\nDownload: {download_url}"
-                )
-            ),
-            image_content,
+            _image_content(encoded, mime_type)
         ]
 
     if mime_type == "application/pdf":
@@ -294,10 +281,9 @@ def attachment_to_content_blocks(database, attachment):
                 page = document[page_number]
                 image = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
                 blocks.append(
-                    ImageContent(
-                        type="image",
-                        data=base64.b64encode(image.tobytes("png")).decode("utf-8"),
-                        mimeType="image/png",
+                    _image_content(
+                        base64.b64encode(image.tobytes("png")).decode("utf-8"),
+                        "image/png",
                     )
                 )
             document.close()

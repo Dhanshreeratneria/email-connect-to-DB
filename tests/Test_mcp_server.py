@@ -1,6 +1,9 @@
 from types import SimpleNamespace
+import base64
 
-from app.mcp.server import group_recipients, serialize
+from mcp.types import ImageContent
+
+from app.mcp.server import attachment_to_content_blocks, group_recipients, serialize
 
 
 def test_group_recipients_splits_by_type():
@@ -65,3 +68,22 @@ def test_serialize_reports_recipient_count_and_passes_through_attachment_type():
     assert [r["email"] for r in result["recipients"]["cc"]] == ["jane@example.com"]
     assert result["attachments"][0]["type"] == "image"
     assert result["category"] == "primary"
+
+
+def test_get_attachment_content_returns_native_image_content():
+    image_bytes = b"\x89PNG\r\n\x1a\nimage-data"
+    attachment = SimpleNamespace(
+        id=1,
+        filename="photo.png",
+        mime_type="image/png",
+        size=len(image_bytes),
+        content=image_bytes,
+    )
+
+    blocks = attachment_to_content_blocks(None, attachment)
+
+    assert len(blocks) == 1
+    assert isinstance(blocks[0], ImageContent)
+    assert blocks[0].type == "image"
+    assert getattr(blocks[0], "mime_type", getattr(blocks[0], "mimeType", None)) == "image/png"
+    assert base64.b64decode(blocks[0].data) == image_bytes
