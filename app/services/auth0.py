@@ -12,6 +12,7 @@ import jwt
 from fastapi import HTTPException, Request
 
 from app.config import settings
+from app.services import connector_auth
 
 
 _claims: ContextVar[dict[str, Any] | None] = ContextVar("auth0_claims", default=None)
@@ -104,7 +105,14 @@ def safe_validate_token(token: str | None) -> dict[str, Any] | None:
     try:
         return validate_token(token)
     except Auth0ConfigurationError:
-        return None
+        connector_token = connector_auth.verify_access_token(token)
+        if not connector_token:
+            return None
+        return {
+            "sub": connector_token["google_email"],
+            "email": connector_token["google_email"],
+            "scope": "read:emails read:attachments download:attachments",
+        }
 
 
 def scopes_from_claims(claims: dict[str, Any]) -> set[str]:
@@ -152,7 +160,7 @@ async def require_http_scope(request: Request, scope: str) -> None:
     authorization = request.headers.get("authorization", "")
     token = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
     try:
-        claims = validate_token(token) if token else None
+        claims = safe_validate_token(token)
         if claims is None:
             raise Auth0ConfigurationError("Missing bearer token")
         if scope not in scopes_from_claims(claims):
