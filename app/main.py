@@ -19,64 +19,78 @@ from app.mcp.server import mcp
 from app.services import admin_auth, auth0, connector_auth
 from app.services.oauth_service import authorization_url
 
-# Configure logging
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# APPLICATION LIFESPAN
+# ============================================================
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan context manager for MCP session"""
+    """Lifespan context manager for MCP session."""
     logger.info("Starting Gmail Email MCP application")
+
     async with mcp.session_manager.run():
         yield
+
     logger.info("Shutting down Gmail Email MCP application")
 
 
-# Initialize FastAPI app
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
 app = FastAPI(
     title="Gmail Email MCP",
     description="Connect your Gmail to Claude.ai via MCP (Model Context Protocol)",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 
+# ============================================================
+# MCP PATH NORMALIZATION
+# ============================================================
+
 class NormalizeMcpPath:
-    """Accept both Claude's slash and no-slash MCP endpoint forms."""
+    """
+    Accept both:
+        /mcp
+        /mcp/
+
+    Claude may call either form.
+    """
 
     def __init__(self, inner_app):
         self.inner_app = inner_app
 
-    logger.info("MCP authorization header present=%s", bool(auth_header))
-
-scheme, separator, credentials = auth_header.partition(" ")
-
-logger.info(
-    "MCP auth scheme=%s credential_present=%s credential_prefix=%s credential_length=%s",
-    scheme,
-    bool(credentials),
-    credentials.strip()[:4] if credentials else "",
-    len(credentials.strip()) if credentials else 0,
-)
-
-if not separator or scheme.lower() != "bearer":
-    return None
-
-token = credentials.strip()
-return token or None
-
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path") == "/mcp":
+
+        if (
+            scope["type"] == "http"
+            and scope.get("path") == "/mcp"
+        ):
             scope = dict(scope)
             scope["path"] = "/mcp/"
             scope["raw_path"] = b"/mcp/"
+
         await self.inner_app(scope, receive, send)
 
 
 app.add_middleware(NormalizeMcpPath)
 
-# Configure CORS middleware
+
+# ============================================================
+# CORS
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,122 +99,348 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+
+# ============================================================
+# ROUTERS
+# ============================================================
+
 app.include_router(auth_router)
 app.include_router(webhook_router)
 app.include_router(emails_router)
 app.include_router(attachments_router)
 app.include_router(admin_router)
 
-# Configure MCP server
+
+# ============================================================
+# MCP SERVER CONFIGURATION
+# ============================================================
+
 logger.info("Configuring MCP server")
+
 mcp.settings.streamable_http_path = "/"
+
 mcp.settings.transport_security = TransportSecuritySettings(
-    allowed_hosts=["email-connect-to-db.onrender.com"],
+    allowed_hosts=[
+        "email-connect-to-db.onrender.com"
+    ],
     allowed_origins=["*"],
 )
 
 
+# ============================================================
+# MCP BEARER TOKEN AUTHENTICATION
+# ============================================================
+
 class RequireBearerToken:
     """
-    ASGI middleware that wraps the MCP app.
-    Validates Bearer tokens before allowing access to the MCP endpoint.
+    Protects the MCP endpoint.
+
+    Supported authentication methods:
+
+    1. MCP_API_KEY
+       Static bearer credential configured in environment.
+
+    2. Database-backed mcp_ token
+       Token generated from the Admin dashboard.
+
+    3. Existing Auth0 JWT
+       Keeps the existing OAuth/Auth0 flow available.
     """
 
     def __init__(self, inner_app):
         self.inner_app = inner_app
-logger.info("MCP authorization header present=%s", bool(auth_header))
 
-scheme, separator, credentials = auth_header.partition(" ")
+    # --------------------------------------------------------
+    # Extract Bearer token
+    # --------------------------------------------------------
 
-logger.info(
-    "MCP auth scheme=%s credential_present=%s credential_prefix=%s credential_length=%s",
-    scheme,
-    bool(credentials),
-    credentials.strip()[:4] if credentials else "",
-    len(credentials.strip()) if credentials else 0,
-)
+    @staticmethod
+    def _extract_token(
+        headers: dict[bytes, bytes],
+    ) -> str | None:
 
-if not separator or scheme.lower() != "bearer":
-    return None
+        auth_header = (
+            headers
+            .get(b"authorization", b"")
+            .decode("latin-1")
+            .strip()
+        )
 
-token = credentials.strip()
-return token or None
+        # No Authorization header
+        if not auth_header:
+            logger.info(
+                "MCP authorization header present=False"
+            )
+            return None
 
-    async def __call__(self, scope, receive, send):
+        logger.info(
+            "MCP authorization header present=True"
+        )
+
+        # Expected format:
+        #
+        # Authorization: Bearer mcp_xxxxxxxxx
+        #
+        scheme, separator, credentials = (
+            auth_header.partition(" ")
+        )
+
+        # Reject malformed authorization header
+        if not separator:
+            logger.info(
+                "MCP authorization header rejected: "
+                "missing separator"
+            )
+            return None
+
+        # Authorization scheme must be Bearer
+        if scheme.lower() != "bearer":
+            logger.info(
+                "MCP authorization scheme rejected: %s",
+                scheme[:30],
+            )
+            return None
+
+        token = credentials.strip()
+
+        if not token:
+            logger.info(
+                "MCP bearer credential is empty"
+            )
+            return None
+
+        # ----------------------------------------------------
+        # SAFE LOGGING
+        # Never print the actual token.
+        # ----------------------------------------------------
+
+        logger.info(
+            "MCP credential prefix=%s length=%d",
+            token[:4],
+            len(token),
+        )
+
+        return token
+
+    # --------------------------------------------------------
+    # ASGI request handler
+    # --------------------------------------------------------
+
+    async def __call__(
+        self,
+        scope,
+        receive,
+        send,
+    ):
+
+        # MCP authentication is only required for HTTP.
         if scope["type"] != "http":
-            await self.inner_app(scope, receive, send)
+            await self.inner_app(
+                scope,
+                receive,
+                send,
+            )
             return
 
-        # Extract Authorization header
-        headers = dict(scope.get("headers") or [])
+        # Convert headers to dictionary
+        headers = dict(
+            scope.get("headers") or []
+        )
+
+        # Extract bearer credential
         token = self._extract_token(headers)
-        is_mcp_token = bool(token and token.startswith(admin_auth.MCP_TOKEN_PREFIX))
-        logger.info("MCP mcp_ token detected=%s", is_mcp_token)
-        
-        # MCP_API_KEY is the static bearer credential documented for direct
-        # Claude connector setup. It must not enter the OAuth redirect flow.
-        if token and settings.mcp_api_key and hmac.compare_digest(token, settings.mcp_api_key):
+
+        token_data = None
+
+        # ====================================================
+        # 1. STATIC MCP_API_KEY
+        # ====================================================
+
+        if (
+            token
+            and settings.mcp_api_key
+            and hmac.compare_digest(
+                token,
+                settings.mcp_api_key,
+            )
+        ):
+
+            logger.info(
+                "MCP authentication: "
+                "static MCP_API_KEY accepted"
+            )
+
             token_data = {
                 "sub": "mcp-api-key",
-                "scope": "read:emails read:attachments download:attachments",
+                "scope": (
+                    "read:emails "
+                    "read:attachments "
+                    "download:attachments"
+                ),
             }
-        # Managed MCP tokens are database credentials, not Auth0 JWTs.
-        # Keep Auth0 and connector authentication unchanged for all other tokens.
-        elif is_mcp_token:
+
+        # ====================================================
+        # 2. DATABASE mcp_ TOKEN
+        # ====================================================
+
+        if token_data is None and token:
+
             with SessionLocal() as database:
-                token_data = admin_auth.validate_token(database, token)
-        else:
-            token_data = auth0.safe_validate_token(token)
+
+                token_data = (
+                    admin_auth.validate_token(
+                        database,
+                        token,
+                    )
+                )
+
+            if token_data:
+
+                logger.info(
+                    "MCP authentication: "
+                    "database token accepted "
+                    "client_id=%s",
+                    token_data.get("client_id"),
+                )
+
+        # ====================================================
+        # 3. EXISTING AUTH0 TOKEN
+        # ====================================================
+
+        if token_data is None and token:
+
+            token_data = (
+                auth0.safe_validate_token(
+                    token
+                )
+            )
+
+            if token_data:
+
+                logger.info(
+                    "MCP authentication: "
+                    "Auth0 token accepted"
+                )
+
+        # ====================================================
+        # 4. INVALID / MISSING TOKEN
+        # ====================================================
 
         if not token_data:
-            base = settings.public_base_url.rstrip("/")
+
+            logger.warning(
+                "MCP authentication failed: "
+                "no valid credential"
+            )
+
+            base = (
+                settings.public_base_url
+                .rstrip("/")
+            )
+
             response = JSONResponse(
                 {
                     "error": "unauthorized",
-                    "error_description": "Missing or invalid access token"
+                    "error_description": (
+                        "Missing or invalid access token"
+                    ),
                 },
                 status_code=401,
                 headers={
                     "WWW-Authenticate": (
                         f'Bearer realm="mcp", '
-                        f'resource_metadata="{base}/.well-known/oauth-protected-resource"'
+                        f'resource_metadata='
+                        f'"{base}/.well-known/'
+                        f'oauth-protected-resource"'
                     )
                 },
             )
-            response.headers.update(auth0.unauthorized_response_headers(base))
-            await response(scope, receive, send)
+
+            response.headers.update(
+                auth0.unauthorized_response_headers(
+                    base
+                )
+            )
+
+            await response(
+                scope,
+                receive,
+                send,
+            )
+
             return
 
-        claims_token = auth0.set_claims(token_data)
+        # ====================================================
+        # AUTHENTICATED REQUEST
+        # ====================================================
+
+        claims_token = (
+            auth0.set_claims(
+                token_data
+            )
+        )
+
         try:
-            await self.inner_app(scope, receive, send)
+
+            await self.inner_app(
+                scope,
+                receive,
+                send,
+            )
+
         finally:
-            auth0.reset_claims(claims_token)
+
+            auth0.reset_claims(
+                claims_token
+            )
 
 
-# Mount MCP endpoint with Bearer token protection
-app.mount("/mcp", RequireBearerToken(mcp.streamable_http_app()), name="mcp")
+# ============================================================
+# MOUNT MCP ENDPOINT
+# ============================================================
+
+app.mount(
+    "/mcp",
+    RequireBearerToken(
+        mcp.streamable_http_app()
+    ),
+    name="mcp",
+)
 
 
-# ==================== PUBLIC ENDPOINTS ====================
+# ============================================================
+# PUBLIC ENDPOINTS
+# ============================================================
 
 @app.get("/health")
 def health():
-    """Health check endpoint"""
-    return {"status": "ok"}
+    """Health check endpoint."""
+
+    return {
+        "status": "ok"
+    }
 
 
 @app.get("/")
 def root():
-    """Root endpoint - service information"""
-    base = settings.public_base_url.rstrip("/")
+    """Service information."""
+
+    base = (
+        settings.public_base_url
+        .rstrip("/")
+    )
+
     return {
         "service": "Gmail Email MCP",
         "version": "1.0",
         "status": "running",
-        "description": "Connect your Gmail to Claude.ai via MCP (Model Context Protocol)",
-        "mcp_endpoint": f"{base}/mcp/",
+        "description": (
+            "Connect your Gmail to Claude.ai "
+            "via MCP (Model Context Protocol)"
+        ),
+        "mcp_endpoint": (
+            f"{base}/mcp/"
+        ),
         "endpoints": {
             "health": "/health",
             "authorize": "/authorize",
@@ -217,7 +457,8 @@ def root():
 
 @app.get("/connector/status")
 def connector_status():
-    """Connector status endpoint"""
+    """Connector status endpoint."""
+
     return {
         "status": "connected",
         "name": "Gmail Email MCP",
@@ -225,15 +466,20 @@ def connector_status():
         "endpoints": {
             "mcp": "/mcp/",
             "emails": "/emails",
-            "health": "/health"
+            "health": "/health",
         },
     }
 
 
 @app.get("/mcp/info")
 def mcp_info():
-    """MCP capabilities and tools information"""
-    base = settings.public_base_url.rstrip("/")
+    """MCP capabilities and tools information."""
+
+    base = (
+        settings.public_base_url
+        .rstrip("/")
+    )
+
     return {
         "name": "Gmail Email MCP",
         "version": "1.0",
@@ -263,69 +509,151 @@ def mcp_info():
     }
 
 
-# ==================== OAUTH ENDPOINTS ====================
+# ============================================================
+# OAUTH ENDPOINTS
+# ============================================================
 
 @app.get("/.well-known/oauth-authorization-server")
 def authorization_server_metadata():
-    """OAuth authorization server metadata endpoint"""
-    base = settings.public_base_url.rstrip("/")
+    """OAuth authorization server metadata."""
+
+    base = (
+        settings.public_base_url
+        .rstrip("/")
+    )
+
     return {
         "issuer": base,
-        "authorization_endpoint": f"{base}/authorize",
-        "token_endpoint": f"{base}/token",
-        "jwks_uri": f"{base}/.well-known/jwks.json",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
-        "scopes_supported": ["read:emails", "read:attachments", "download:attachments"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "authorization_endpoint": (
+            f"{base}/authorize"
+        ),
+        "token_endpoint": (
+            f"{base}/token"
+        ),
+        "jwks_uri": (
+            f"{base}/.well-known/jwks.json"
+        ),
+        "response_types_supported": [
+            "code"
+        ],
+        "grant_types_supported": [
+            "authorization_code"
+        ],
+        "scopes_supported": [
+            "read:emails",
+            "read:attachments",
+            "download:attachments",
+        ],
+        "token_endpoint_auth_methods_supported": [
+            "client_secret_post",
+            "none",
+        ],
     }
 
 
 @app.get("/.well-known/oauth-protected-resource")
 def protected_resource_metadata():
-    """Protected resource metadata endpoint"""
-    base = settings.public_base_url.rstrip("/")
+    """OAuth protected resource metadata."""
+
+    base = (
+        settings.public_base_url
+        .rstrip("/")
+    )
+
     return {
-        "resource": f"{base}/mcp/",
-        "authorization_servers": [base],
-        "scopes_supported": ["read:emails", "read:attachments", "download:attachments"],
-        "bearer_methods_supported": ["header"],
+        "resource": (
+            f"{base}/mcp/"
+        ),
+        "authorization_servers": [
+            base
+        ],
+        "scopes_supported": [
+            "read:emails",
+            "read:attachments",
+            "download:attachments",
+        ],
+        "bearer_methods_supported": [
+            "header"
+        ],
     }
 
 
+# ============================================================
+# OAUTH CLIENT REGISTRATION
+# ============================================================
+
 @app.post("/register")
-async def register_client(request: Request):
+async def register_client(
+    request: Request,
+):
     """
     OAuth client registration endpoint.
-    Registers a new OAuth client and returns client_id.
     """
+
     try:
+
         body = await request.json()
-        redirect_uris = body.get("redirect_uris", [])
-        
-        if not redirect_uris:
-            return JSONResponse(
-                {"error": "invalid_request", "error_description": "redirect_uris required"},
-                status_code=400
-            )
-        
-        client_id = connector_auth.register_client(redirect_uris)
-        logger.info(f"Registered new OAuth client: {client_id}")
-        
-        return JSONResponse({
-            "client_id": client_id,
-            "redirect_uris": redirect_uris,
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-        })
-    except Exception as e:
-        logger.exception("Client registration error")
-        return JSONResponse(
-            {"error": "server_error", "error_description": str(e)},
-            status_code=500
+
+        redirect_uris = body.get(
+            "redirect_uris",
+            []
         )
 
+        if not redirect_uris:
+
+            return JSONResponse(
+                {
+                    "error": "invalid_request",
+                    "error_description": (
+                        "redirect_uris required"
+                    ),
+                },
+                status_code=400,
+            )
+
+        client_id = (
+            connector_auth.register_client(
+                redirect_uris
+            )
+        )
+
+        logger.info(
+            "Registered new OAuth client: %s",
+            client_id,
+        )
+
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "redirect_uris": redirect_uris,
+                "token_endpoint_auth_method": "none",
+                "grant_types": [
+                    "authorization_code"
+                ],
+                "response_types": [
+                    "code"
+                ],
+            }
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Client registration error"
+        )
+
+        return JSONResponse(
+            {
+                "error": "server_error",
+                "error_description": str(e),
+            },
+            status_code=500,
+        )
+
+
+# ============================================================
+# OAUTH AUTHORIZE
+# ============================================================
 
 @app.get("/authorize")
 @app.post("/authorize")
@@ -341,161 +669,331 @@ async def authorize(
 ):
     """
     OAuth authorization endpoint.
-    Bounces the browser through real Google login.
-    Supports both GET and POST requests.
-    
-    Only the mailbox owner (checked in /auth/google/callback) gets a code.
+
+    Redirects through Google OAuth.
     """
-    logger.info(f"Authorization request - client_id: {client_id}, redirect_uri: {redirect_uri}")
-    
-    if response_type != "code" or not redirect_uri or not code_challenge:
-        logger.warning(f"Invalid authorization request - response_type: {response_type}, redirect_uri: {redirect_uri}, code_challenge: {code_challenge}")
+
+    logger.info(
+        "Authorization request - "
+        "client_id=%s redirect_uri=%s",
+        client_id,
+        redirect_uri,
+    )
+
+    if (
+        response_type != "code"
+        or not redirect_uri
+        or not code_challenge
+    ):
+
+        logger.warning(
+            "Invalid authorization request"
+        )
+
         return JSONResponse(
             {
                 "error": "invalid_request",
-                "error_description": "Missing required parameters: response_type=code, redirect_uri, code_challenge"
+                "error_description": (
+                    "Missing required parameters: "
+                    "response_type=code, "
+                    "redirect_uri, "
+                    "code_challenge"
+                ),
             },
-            status_code=400
+            status_code=400,
         )
 
     try:
-        conn_state = connector_auth.start_authorization(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            code_challenge=code_challenge,
-            code_challenge_method=code_challenge_method,
-            state=state,
-            resource=resource,
+
+        conn_state = (
+            connector_auth.start_authorization(
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                state=state,
+                resource=resource,
+            )
         )
 
-        google_auth_url, google_state = authorization_url()
-        connector_auth.map_google_state(google_state, conn_state)
+        google_auth_url, google_state = (
+            authorization_url()
+        )
 
-        logger.info(f"Redirecting to Google OAuth - state: {conn_state}")
-        return RedirectResponse(google_auth_url)
-    
+        connector_auth.map_google_state(
+            google_state,
+            conn_state,
+        )
+
+        logger.info(
+            "Redirecting to Google OAuth"
+        )
+
+        return RedirectResponse(
+            google_auth_url
+        )
+
     except Exception as e:
-        logger.exception("Authorization endpoint error")
-        return JSONResponse(
-            {"error": "server_error", "error_description": str(e)},
-            status_code=500
+
+        logger.exception(
+            "Authorization endpoint error"
         )
 
+        return JSONResponse(
+            {
+                "error": "server_error",
+                "error_description": str(e),
+            },
+            status_code=500,
+        )
+
+
+# ============================================================
+# OAUTH TOKEN ENDPOINT
+# ============================================================
 
 @app.post("/token")
 @app.get("/token")
-async def token_endpoint(request: Request):
+async def token_endpoint(
+    request: Request,
+):
     """
     OAuth token exchange endpoint.
-    Exchanges authorization code for access token.
-    Supports both GET and POST requests.
-    
-    Required parameters:
-    - grant_type: "authorization_code"
-    - code: Authorization code from /authorize
-    - code_verifier: PKCE code verifier
-    - redirect_uri: Must match the redirect_uri from /authorize
     """
-    logger.info(f"Token endpoint - method: {request.method}")
-    
+
+    logger.info(
+        "Token endpoint - method=%s",
+        request.method,
+    )
+
     try:
-        # Handle both GET query params and POST form data
+
         if request.method == "POST":
+
             form = await request.form()
-        else:  # GET
+
+        else:
+
             form = request.query_params
-        
-        grant_type = form.get("grant_type")
-        code = form.get("code")
-        code_verifier = form.get("code_verifier")
-        redirect_uri = form.get("redirect_uri")
-        
-        logger.info(f"Token request - grant_type: {grant_type}, code: {code[:10] if code else None}...")
-        
+
+        grant_type = form.get(
+            "grant_type"
+        )
+
+        code = form.get(
+            "code"
+        )
+
+        code_verifier = form.get(
+            "code_verifier"
+        )
+
+        redirect_uri = form.get(
+            "redirect_uri"
+        )
+
+        logger.info(
+            "Token request - "
+            "grant_type=%s code_present=%s",
+            grant_type,
+            bool(code),
+        )
+
         if grant_type != "authorization_code":
-            logger.warning(f"Invalid grant type: {grant_type}")
-            return JSONResponse(
-                {"error": "unsupported_grant_type"},
-                status_code=400
+
+            logger.warning(
+                "Invalid grant type: %s",
+                grant_type,
             )
 
-        data = connector_auth.redeem_auth_code(code, code_verifier, redirect_uri)
+            return JSONResponse(
+                {
+                    "error":
+                        "unsupported_grant_type"
+                },
+                status_code=400,
+            )
+
+        data = (
+            connector_auth.redeem_auth_code(
+                code,
+                code_verifier,
+                redirect_uri,
+            )
+        )
+
         if not data:
-            logger.warning(f"Failed to redeem auth code: {code}")
-            return JSONResponse(
-                {"error": "invalid_grant", "error_description": "Invalid authorization code"},
-                status_code=400
+
+            logger.warning(
+                "Failed to redeem auth code"
             )
 
-        token_response = connector_auth.issue_access_token(data["google_email"])
-        logger.info(f"Token issued for: {data['google_email']}")
-        return JSONResponse(token_response)
-    
-    except Exception as e:
-        logger.exception("Token endpoint error")
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": (
+                        "Invalid authorization code"
+                    ),
+                },
+                status_code=400,
+            )
+
+        token_response = (
+            connector_auth.issue_access_token(
+                data["google_email"]
+            )
+        )
+
+        logger.info(
+            "Token issued for: %s",
+            data["google_email"],
+        )
+
         return JSONResponse(
-            {"error": "server_error", "error_description": str(e)},
-            status_code=500
+            token_response
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Token endpoint error"
+        )
+
+        return JSONResponse(
+            {
+                "error": "server_error",
+                "error_description": str(e),
+            },
+            status_code=500,
         )
 
 
-# ==================== ERROR HANDLERS ====================
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
 
 @app.exception_handler(404)
-async def not_found_exception_handler(request: Request, exc):
-    """Handle 404 Not Found errors"""
+async def not_found_exception_handler(
+    request: Request,
+    exc,
+):
+    """Handle 404."""
+
     return JSONResponse(
-        {"error": "not_found", "message": f"Endpoint {request.url.path} not found"},
-        status_code=404
+        {
+            "error": "not_found",
+            "message": (
+                f"Endpoint {request.url.path} "
+                "not found"
+            ),
+        },
+        status_code=404,
     )
 
 
 @app.exception_handler(500)
-async def internal_server_error_handler(request: Request, exc):
-    """Handle 500 Internal Server Error"""
-    logger.exception("Unhandled exception in request")
+async def internal_server_error_handler(
+    request: Request,
+    exc,
+):
+    """Handle 500."""
+
+    logger.exception(
+        "Unhandled exception in request"
+    )
+
     return JSONResponse(
-        {"error": "internal_server_error", "message": "An internal error occurred"},
-        status_code=500
+        {
+            "error": "internal_server_error",
+            "message": (
+                "An internal error occurred"
+            ),
+        },
+        status_code=500,
     )
 
 
-# ==================== STARTUP ====================
+# ============================================================
+# STARTUP
+# ============================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Startup event - log application initialization"""
+
     logger.info("=" * 50)
-    logger.info("Gmail Email MCP Starting Up")
+    logger.info(
+        "Gmail Email MCP Starting Up"
+    )
     logger.info("=" * 50)
-    logger.info(f"Environment: {settings.environment}")
-    logger.info(f"Public Base URL: {settings.public_base_url}")
-    logger.info(f"Database: {settings.database_url.split('@')[1] if '@' in settings.database_url else 'configured'}")
-    logger.info(f"MCP Endpoint: {settings.public_base_url}/mcp")
+
+    logger.info(
+        "Environment: %s",
+        settings.environment,
+    )
+
+    logger.info(
+        "Public Base URL: %s",
+        settings.public_base_url,
+    )
+
+    logger.info(
+        "Database: %s",
+        (
+            settings.database_url.split("@")[1]
+            if "@" in settings.database_url
+            else "configured"
+        ),
+    )
+
+    logger.info(
+        "MCP Endpoint: %s/mcp/",
+        settings.public_base_url.rstrip("/"),
+    )
+
     logger.info("=" * 50)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Shutdown event - log application shutdown"""
-    logger.info("Gmail Email MCP Shutting Down")
+
+    logger.info(
+        "Gmail Email MCP Shutting Down"
+    )
 
 
-# ==================== DEBUGGING ====================
+# ============================================================
+# LOCAL DEVELOPMENT
+# ============================================================
 
 if __name__ == "__main__":
-    import uvicorn
-    import os
 
-    port = int(os.getenv("PORT", "8000"))
-    
-    logger.info("Starting Gmail Email MCP server")
-    logger.info(f"Listening on http://0.0.0.0:{port}")
-    logger.info(f"API Docs: http://0.0.0.0:{port}/docs")
-    
+    import os
+    import uvicorn
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "8000",
+        )
+    )
+
+    logger.info(
+        "Starting Gmail Email MCP server"
+    )
+
+    logger.info(
+        "Listening on http://0.0.0.0:%s",
+        port,
+    )
+
+    logger.info(
+        "API Docs: http://0.0.0.0:%s/docs",
+        port,
+    )
+
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=port,
-        log_level="info"
+        log_level="info",
     )
