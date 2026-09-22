@@ -48,6 +48,16 @@ class NormalizeMcpPath:
     def __init__(self, inner_app):
         self.inner_app = inner_app
 
+    @staticmethod
+    def _extract_token(headers: dict[bytes, bytes]) -> str | None:
+        auth_header = headers.get(b"authorization", b"").decode("latin-1").strip()
+        logger.info("MCP authorization header present=%s", bool(auth_header))
+        scheme, separator, credentials = auth_header.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            return None
+        token = credentials.strip()
+        return token or None
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path") == "/mcp":
             scope = dict(scope)
@@ -92,6 +102,16 @@ class RequireBearerToken:
     def __init__(self, inner_app):
         self.inner_app = inner_app
 
+    @staticmethod
+    def _extract_token(headers: dict[bytes, bytes]) -> str | None:
+        auth_header = headers.get(b"authorization", b"").decode("latin-1").strip()
+        logger.info("MCP authorization header present=%s", bool(auth_header))
+        scheme, separator, credentials = auth_header.partition(" ")
+        if not separator or scheme.lower() != "bearer":
+            return None
+        token = credentials.strip()
+        return token or None
+
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.inner_app(scope, receive, send)
@@ -99,8 +119,9 @@ class RequireBearerToken:
 
         # Extract Authorization header
         headers = dict(scope.get("headers") or [])
-        auth_header = headers.get(b"authorization", b"").decode()
-        token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else None
+        token = self._extract_token(headers)
+        is_mcp_token = bool(token and token.startswith(admin_auth.MCP_TOKEN_PREFIX))
+        logger.info("MCP mcp_ token detected=%s", is_mcp_token)
         
         # MCP_API_KEY is the static bearer credential documented for direct
         # Claude connector setup. It must not enter the OAuth redirect flow.
@@ -111,7 +132,7 @@ class RequireBearerToken:
             }
         # Managed MCP tokens are database credentials, not Auth0 JWTs.
         # Keep Auth0 and connector authentication unchanged for all other tokens.
-        elif token and token.startswith(admin_auth.MCP_TOKEN_PREFIX):
+        elif is_mcp_token:
             with SessionLocal() as database:
                 token_data = admin_auth.validate_token(database, token)
         else:
