@@ -48,15 +48,23 @@ class NormalizeMcpPath:
     def __init__(self, inner_app):
         self.inner_app = inner_app
 
-    @staticmethod
-    def _extract_token(headers: dict[bytes, bytes]) -> str | None:
-        auth_header = headers.get(b"authorization", b"").decode("latin-1").strip()
-        logger.info("MCP authorization header present=%s", bool(auth_header))
-        scheme, separator, credentials = auth_header.partition(" ")
-        if not separator or scheme.lower() != "bearer":
-            return None
-        token = credentials.strip()
-        return token or None
+    logger.info("MCP authorization header present=%s", bool(auth_header))
+
+scheme, separator, credentials = auth_header.partition(" ")
+
+logger.info(
+    "MCP auth scheme=%s credential_present=%s credential_prefix=%s credential_length=%s",
+    scheme,
+    bool(credentials),
+    credentials.strip()[:4] if credentials else "",
+    len(credentials.strip()) if credentials else 0,
+)
+
+if not separator or scheme.lower() != "bearer":
+    return None
+
+token = credentials.strip()
+return token or None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope.get("path") == "/mcp":
@@ -101,16 +109,23 @@ class RequireBearerToken:
 
     def __init__(self, inner_app):
         self.inner_app = inner_app
+logger.info("MCP authorization header present=%s", bool(auth_header))
 
-    @staticmethod
-    def _extract_token(headers: dict[bytes, bytes]) -> str | None:
-        auth_header = headers.get(b"authorization", b"").decode("latin-1").strip()
-        logger.info("MCP authorization header present=%s", bool(auth_header))
-        scheme, separator, credentials = auth_header.partition(" ")
-        if not separator or scheme.lower() != "bearer":
-            return None
-        token = credentials.strip()
-        return token or None
+scheme, separator, credentials = auth_header.partition(" ")
+
+logger.info(
+    "MCP auth scheme=%s credential_present=%s credential_prefix=%s credential_length=%s",
+    scheme,
+    bool(credentials),
+    credentials.strip()[:4] if credentials else "",
+    len(credentials.strip()) if credentials else 0,
+)
+
+if not separator or scheme.lower() != "bearer":
+    return None
+
+token = credentials.strip()
+return token or None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
